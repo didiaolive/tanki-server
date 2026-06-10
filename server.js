@@ -209,6 +209,26 @@ function handleJoinRandom(ws) {
   tryMatchRandom();
 }
 
+function handleSurrender(ws) {
+  const client = clients.get(ws);
+  if (!client || !client.roomId) {
+    sendError(ws, "尚未加入房間");
+    return;
+  }
+
+  const room = rooms.get(client.roomId);
+  if (!room || room.state !== "playing") {
+    sendError(ws, "對戰尚未開始");
+    return;
+  }
+
+  room.state = "finished";
+  broadcastAll(room, {
+    type: "surrender",
+    player_index: client.playerIndex,
+  });
+}
+
 function handleSubmitTurn(ws, data) {
   const client = clients.get(ws);
   if (!client || !client.roomId) {
@@ -292,6 +312,9 @@ wss.on("connection", (ws) => {
         break;
       case "submit_turn":
         handleSubmitTurn(ws, data);
+        break;
+      case "surrender":
+        handleSurrender(ws);
         break;
       default:
         sendError(ws, `未知指令: ${data.type}`);
