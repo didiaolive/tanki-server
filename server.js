@@ -1,0 +1,310 @@
+const http = require("http");
+const { WebSocketServer } = require("ws");
+
+const PORT = process.env.PORT || 8765;
+
+/** @type {Map<string, any>} */
+const rooms = new Map();
+/** @type {Map<WebSocket, any>} */
+const clients = new Map();
+/** @type {WebSocket[]} */
+const matchQueue = [];
+
+let nextClientId = 1;
+
+function makeRoomId() {
+  const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+  let id = "";
+  for (let i = 0; i < 6; i++) {
+    id += chars[Math.floor(Math.random() * chars.length)];
+  }
+  if (rooms.has(id)) return makeRoomId();
+  return id;
+}
+
+function send(ws, payload) {
+  if (ws.readyState === ws.OPEN) {
+    ws.send(JSON.stringify(payload));
+  }
+}
+
+function sendError(ws, message) {
+  send(ws, { type: "error", message });
+}
+
+function getPublicRoomList() {
+  return Array.from(rooms.values())
+    .filter((room) => room.state === "waiting")
+    .map((room) => ({
+      id: room.id,
+      name: room.name,
+      has_password: Boolean(room.password),
+      players: room.players.length,
+    }));
+}
+
+function removeFromQueue(ws) {
+  const index = matchQueue.indexOf(ws);
+  if (index >= 0) matchQueue.splice(index, 1);
+}
+
+function leaveRoom(ws) {
+  const client = clients.get(ws);
+  if (!client || !client.roomId) return;
+
+  const room = rooms.get(client.roomId);
+  if (!room) return;
+
+  room.players = room.players.filter((p) => p.ws !== ws);
+  broadcastRoom(room, {
+    type: "player_left",
+    room_id: room.id,
+    players: room.players.length,
+  });
+
+  if (room.players.length === 0) {
+    rooms.delete(room.id);
+  } else {
+    room.state = "waiting";
+    room.turns = [{}, {}];
+  }
+
+  client.roomId = null;
+  client.playerIndex = -1;
+}
+
+function broadcastRoom(room, payload, exceptWs = null) {
+  for (const player of room.players) {
+    if (player.ws !== exceptWs) {
+      send(player.ws, payload);
+    }
+  }
+}
+
+function broadcastAll(room, payload) {
+  for (const player of room.players) {
+    send(player.ws, payload);
+  }
+}
+
+function tryStartGame(room) {
+  if (room.players.length < 2 || room.state !== "waiting") return;
+  room.state = "playing";
+  room.turns = [{}, {}];
+  broadcastAll(room, {
+    type: "game_start",
+    room_id: room.id,
+    players: room.players.length,
+  });
+}
+
+function tryMatchRandom() {
+  while (matchQueue.length >= 2) {
+    const wsA = matchQueue.shift();
+    const wsB = matchQueue.shift();
+    const roomId = makeRoomId();
+    const room = {
+      id: roomId,
+      name: `隨機對戰 ${roomId}`,
+      password: "",
+      state: "waiting",
+      turns: [{}, {}],
+      players: [],
+    };
+    rooms.set(roomId, room);
+    joinPlayerToRoom(wsA, room, 0);
+    joinPlayerToRoom(wsB, room, 1);
+    tryStartGame(room);
+  }
+}
+
+function joinPlayerToRoom(ws, room, playerIndex) {
+  const client = clients.get(ws);
+  if (!client) return false;
+
+  if (room.players.length >= 2) return false;
+
+  if (playerIndex < 0) {
+    playerIndex = room.players.length;
+  }
+
+  room.players.push({ ws, playerIndex });
+  client.roomId = room.id;
+  client.playerIndex = playerIndex;
+
+  send(ws, {
+    type: "joined_room",
+    room_id: room.id,
+    room_name: room.name,
+    player_index: playerIndex,
+    players: room.players.length,
+  });
+
+  broadcastRoom(
+    room,
+    {
+      type: "player_joined",
+      room_id: room.id,
+      players: room.players.length,
+    },
+    ws
+  );
+
+  return true;
+}
+
+function handleCreateRoom(ws, data) {
+  const name = (data.name || "未命名房間").trim().slice(0, 32);
+  const password = (data.password || "").trim();
+  const roomId = makeRoomId();
+  const room = {
+    id: roomId,
+    name,
+    password,
+    state: "waiting",
+    turns: [{}, {}],
+    players: [],
+  };
+  rooms.set(roomId, room);
+  leaveRoom(ws);
+  joinPlayerToRoom(ws, room, 0);
+  send(ws, {
+    type: "room_created",
+    room_id: roomId,
+    room_name: name,
+    player_index: 0,
+  });
+}
+
+function handleJoinRoom(ws, data) {
+  const roomId = String(data.room_id || "").trim().toUpperCase();
+  const password = String(data.password || "").trim();
+  const room = rooms.get(roomId);
+
+  if (!room) {
+    sendError(ws, "找不到房間");
+    return;
+  }
+  if (room.password && room.password !== password) {
+    sendError(ws, "房間密碼錯誤");
+    return;
+  }
+  if (room.players.length >= 2) {
+    sendError(ws, "房間已滿");
+    return;
+  }
+
+  leaveRoom(ws);
+  joinPlayerToRoom(ws, room, room.players.length);
+  tryStartGame(room);
+}
+
+function handleJoinRandom(ws) {
+  removeFromQueue(ws);
+  leaveRoom(ws);
+  if (!matchQueue.includes(ws)) {
+    matchQueue.push(ws);
+  }
+  send(ws, { type: "match_queued" });
+  tryMatchRandom();
+}
+
+function handleSubmitTurn(ws, data) {
+  const client = clients.get(ws);
+  if (!client || !client.roomId) {
+    sendError(ws, "尚未加入房間");
+    return;
+  }
+
+  const room = rooms.get(client.roomId);
+  if (!room || room.state !== "playing") {
+    sendError(ws, "對戰尚未開始");
+    return;
+  }
+
+  const move = data.move;
+  const shoot = data.shoot;
+  if (!Array.isArray(move) || move.length !== 2 || !Array.isArray(shoot) || shoot.length !== 2) {
+    sendError(ws, "回合資料格式錯誤");
+    return;
+  }
+
+  const index = client.playerIndex;
+  room.turns[index] = {
+    move: [Number(move[0]), Number(move[1])],
+    shoot: [Number(shoot[0]), Number(shoot[1])],
+  };
+
+  const submitted = room.turns.filter((turn) => turn.move && turn.shoot).length;
+  broadcastAll(room, {
+    type: "turn_status",
+    submitted,
+    total: 2,
+  });
+
+  if (submitted < 2) return;
+
+  broadcastAll(room, {
+    type: "round_execute",
+    turns: room.turns.map((turn) => ({
+      move: turn.move,
+      shoot: turn.shoot,
+    })),
+  });
+
+  room.turns = [{}, {}];
+}
+
+const server = http.createServer((_req, res) => {
+  res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8" });
+  res.end("坦棋 Tanki server is running.\n");
+});
+
+const wss = new WebSocketServer({ server });
+
+wss.on("connection", (ws) => {
+  const clientId = nextClientId++;
+  clients.set(ws, { id: clientId, roomId: null, playerIndex: -1 });
+
+  send(ws, { type: "connected", client_id: clientId });
+
+  ws.on("message", (raw) => {
+    let data;
+    try {
+      data = JSON.parse(String(raw));
+    } catch {
+      sendError(ws, "無效的 JSON");
+      return;
+    }
+
+    switch (data.type) {
+      case "list_rooms":
+        send(ws, { type: "room_list", rooms: getPublicRoomList() });
+        break;
+      case "create_room":
+        handleCreateRoom(ws, data);
+        break;
+      case "join_room":
+        handleJoinRoom(ws, data);
+        break;
+      case "join_random":
+        handleJoinRandom(ws);
+        break;
+      case "submit_turn":
+        handleSubmitTurn(ws, data);
+        break;
+      default:
+        sendError(ws, `未知指令: ${data.type}`);
+    }
+  });
+
+  ws.on("close", () => {
+    removeFromQueue(ws);
+    leaveRoom(ws);
+    clients.delete(ws);
+  });
+});
+
+server.listen(PORT, () => {
+  console.log(`Tanki server listening on port ${PORT}`);
+});
