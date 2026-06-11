@@ -2,6 +2,7 @@ const http = require("http");
 const { WebSocketServer } = require("ws");
 
 const PORT = process.env.PORT || 8765;
+const SERVER_VERSION = "v22";
 
 /** @type {Map<string, any>} */
 const rooms = new Map();
@@ -362,7 +363,7 @@ function handleSubmitTurn(ws, data) {
 
 const server = http.createServer((_req, res) => {
   res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8" });
-  res.end("坦棋 Tanki server is running.\n");
+  res.end(`坦棋 Tanki server is running.\n版本: ${SERVER_VERSION}\n`);
 });
 
 const wss = new WebSocketServer({ server });
@@ -376,7 +377,7 @@ wss.on("connection", (ws) => {
     displayName: "玩家",
   });
 
-  send(ws, { type: "connected", client_id: clientId });
+  send(ws, { type: "connected", client_id: clientId, server_version: SERVER_VERSION });
 
   ws.on("message", (raw) => {
     let data;
