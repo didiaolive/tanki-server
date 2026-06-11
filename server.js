@@ -60,18 +60,33 @@ function leaveRoom(ws) {
   const room = rooms.get(client.roomId);
   if (!room) return;
 
+  const wasPlaying = room.state === "playing";
+  const leavingIndex = client.playerIndex;
+
   room.players = room.players.filter((p) => p.ws !== ws);
-  broadcastRoom(room, {
-    type: "player_left",
-    room_id: room.id,
-    players: room.players.length,
-  });
+
+  if (wasPlaying && room.players.length === 1) {
+    const winner = room.players[0];
+    room.state = "finished";
+    send(winner.ws, {
+      type: "match_end",
+      reason: "opponent_left",
+      winner_index: winner.playerIndex,
+      left_player_index: leavingIndex,
+    });
+  } else if (room.players.length > 0) {
+    broadcastRoom(room, {
+      type: "player_left",
+      room_id: room.id,
+      players: room.players.length,
+      left_player_index: leavingIndex,
+    });
+    room.state = "waiting";
+    room.turns = [{}, {}];
+  }
 
   if (room.players.length === 0) {
     rooms.delete(room.id);
-  } else {
-    room.state = "waiting";
-    room.turns = [{}, {}];
   }
 
   client.roomId = null;
@@ -103,13 +118,18 @@ function tryStartGame(room) {
   if (room.players.length < 2 || room.state !== "waiting") return;
   room.state = "playing";
   room.turns = [{}, {}];
-  broadcastAll(room, {
-    type: "game_start",
-    room_id: room.id,
-    players: room.players.length,
-    first_attacker: Math.floor(Math.random() * 2),
-    player_names: getSortedPlayerNames(room),
-  });
+  const firstAttacker = Math.floor(Math.random() * 2);
+  const playerNames = getSortedPlayerNames(room);
+  for (const player of room.players) {
+    send(player.ws, {
+      type: "game_start",
+      room_id: room.id,
+      players: room.players.length,
+      player_index: player.playerIndex,
+      first_attacker: firstAttacker,
+      player_names: playerNames,
+    });
+  }
 }
 
 function tryMatchRandom() {
