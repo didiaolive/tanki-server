@@ -153,6 +153,7 @@ function joinPlayerToRoom(ws, room, playerIndex) {
     room_name: room.name,
     player_index: playerIndex,
     players: room.players.length,
+    player_names: getSortedPlayerNames(room),
   });
 
   broadcastRoom(
@@ -233,6 +234,25 @@ function handleJoinRandom(ws, data) {
   }
   send(ws, { type: "match_queued" });
   tryMatchRandom();
+}
+
+function handleAnnouncePlayerName(ws, data) {
+  applyPlayerName(ws, data);
+  const client = clients.get(ws);
+  if (!client || !client.roomId) return;
+
+  const room = rooms.get(client.roomId);
+  if (!room) return;
+
+  const player = room.players.find((entry) => entry.ws === ws);
+  if (player) {
+    player.displayName = normalizePlayerName(client.displayName);
+  }
+
+  broadcastAll(room, {
+    type: "player_names_sync",
+    player_names: getSortedPlayerNames(room),
+  });
 }
 
 function handleSurrender(ws) {
@@ -351,6 +371,9 @@ wss.on("connection", (ws) => {
         break;
       case "surrender":
         handleSurrender(ws);
+        break;
+      case "announce_player_name":
+        handleAnnouncePlayerName(ws, data);
         break;
       default:
         sendError(ws, `未知指令: ${data.type}`);
