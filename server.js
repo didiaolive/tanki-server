@@ -187,6 +187,13 @@ function joinPlayerToRoom(ws, room, playerIndex) {
     ws
   );
 
+  if (room.players.length >= 2) {
+    broadcastAll(room, {
+      type: "player_names_sync",
+      player_names: getSortedPlayerNames(room),
+    });
+  }
+
   return true;
 }
 
