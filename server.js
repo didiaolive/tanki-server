@@ -22,6 +22,11 @@ function makeRoomId() {
   return id;
 }
 
+function normalizePlayerName(raw) {
+  const name = String(raw || "玩家").trim().slice(0, 12);
+  return name || "玩家";
+}
+
 function send(ws, payload) {
   if (ws.readyState === ws.OPEN) {
     ws.send(JSON.stringify(payload));
@@ -87,6 +92,13 @@ function broadcastAll(room, payload) {
   }
 }
 
+function getSortedPlayerNames(room) {
+  return room.players
+    .slice()
+    .sort((a, b) => a.playerIndex - b.playerIndex)
+    .map((player) => player.displayName);
+}
+
 function tryStartGame(room) {
   if (room.players.length < 2 || room.state !== "waiting") return;
   room.state = "playing";
@@ -95,6 +107,8 @@ function tryStartGame(room) {
     type: "game_start",
     room_id: room.id,
     players: room.players.length,
+    first_attacker: Math.floor(Math.random() * 2),
+    player_names: getSortedPlayerNames(room),
   });
 }
 
@@ -128,7 +142,8 @@ function joinPlayerToRoom(ws, room, playerIndex) {
     playerIndex = room.players.length;
   }
 
-  room.players.push({ ws, playerIndex });
+  const displayName = normalizePlayerName(client.displayName);
+  room.players.push({ ws, playerIndex, displayName });
   client.roomId = room.id;
   client.playerIndex = playerIndex;
 
@@ -153,7 +168,16 @@ function joinPlayerToRoom(ws, room, playerIndex) {
   return true;
 }
 
+function applyPlayerName(ws, data) {
+  const client = clients.get(ws);
+  if (!client) return;
+  if (data.player_name != null) {
+    client.displayName = normalizePlayerName(data.player_name);
+  }
+}
+
 function handleCreateRoom(ws, data) {
+  applyPlayerName(ws, data);
   const name = (data.name || "未命名房間").trim().slice(0, 32);
   const password = (data.password || "").trim();
   const roomId = makeRoomId();
@@ -177,6 +201,7 @@ function handleCreateRoom(ws, data) {
 }
 
 function handleJoinRoom(ws, data) {
+  applyPlayerName(ws, data);
   const roomId = String(data.room_id || "").trim().toUpperCase();
   const password = String(data.password || "").trim();
   const room = rooms.get(roomId);
@@ -199,7 +224,8 @@ function handleJoinRoom(ws, data) {
   tryStartGame(room);
 }
 
-function handleJoinRandom(ws) {
+function handleJoinRandom(ws, data) {
+  applyPlayerName(ws, data);
   removeFromQueue(ws);
   leaveRoom(ws);
   if (!matchQueue.includes(ws)) {
@@ -284,7 +310,12 @@ const wss = new WebSocketServer({ server });
 
 wss.on("connection", (ws) => {
   const clientId = nextClientId++;
-  clients.set(ws, { id: clientId, roomId: null, playerIndex: -1 });
+  clients.set(ws, {
+    id: clientId,
+    roomId: null,
+    playerIndex: -1,
+    displayName: "玩家",
+  });
 
   send(ws, { type: "connected", client_id: clientId });
 
@@ -308,7 +339,12 @@ wss.on("connection", (ws) => {
         handleJoinRoom(ws, data);
         break;
       case "join_random":
-        handleJoinRandom(ws);
+        handleJoinRandom(ws, data);
+        break;
+      case "cancel_matchmaking":
+        removeFromQueue(ws);
+        leaveRoom(ws);
+        send(ws, { type: "match_cancelled" });
         break;
       case "submit_turn":
         handleSubmitTurn(ws, data);
