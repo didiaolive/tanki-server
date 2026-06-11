@@ -61,11 +61,12 @@ function leaveRoom(ws) {
   if (!room) return;
 
   const wasPlaying = room.state === "playing";
+  const wasFinished = room.state === "finished";
   const leavingIndex = client.playerIndex;
 
   room.players = room.players.filter((p) => p.ws !== ws);
 
-  if (wasPlaying && room.players.length === 1) {
+  if ((wasPlaying || wasFinished) && room.players.length === 1) {
     const winner = room.players[0];
     room.state = "finished";
     send(winner.ws, {
@@ -289,10 +290,21 @@ function handleSurrender(ws) {
   }
 
   room.state = "finished";
-  broadcastAll(room, {
-    type: "surrender",
-    player_index: client.playerIndex,
-  });
+  const surrenderIndex = client.playerIndex;
+  const winnerIndex = room.players.find((p) => p.playerIndex !== surrenderIndex)?.playerIndex ?? -1;
+  const payload = {
+    type: "match_end",
+    reason: "surrender",
+    winner_index: winnerIndex,
+    surrender_player_index: surrenderIndex,
+  };
+  for (const player of room.players) {
+    send(player.ws, payload);
+    send(player.ws, {
+      type: "surrender",
+      player_index: surrenderIndex,
+    });
+  }
 }
 
 function handleSubmitTurn(ws, data) {
@@ -385,6 +397,9 @@ wss.on("connection", (ws) => {
         removeFromQueue(ws);
         leaveRoom(ws);
         send(ws, { type: "match_cancelled" });
+        break;
+      case "leave_match":
+        leaveRoom(ws);
         break;
       case "submit_turn":
         handleSubmitTurn(ws, data);
