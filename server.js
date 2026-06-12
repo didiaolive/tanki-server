@@ -2,7 +2,7 @@ const http = require("http");
 const { WebSocketServer } = require("ws");
 
 const PORT = process.env.PORT || 8765;
-const SERVER_VERSION = "v24";
+const SERVER_VERSION = "v25";
 
 const DEFAULT_TANK_POSITIONS = [[6, 9], [3, 0]];
 const TURN_BACKUP_FIRST_ROUND_MS = 50000;
@@ -30,6 +30,21 @@ function makeRoomId() {
 function normalizePlayerName(raw) {
   const name = String(raw || "玩家").trim().slice(0, 12);
   return name || "玩家";
+}
+
+function normalizeTankIndex(raw) {
+  const index = Number(raw);
+  if (!Number.isInteger(index) || index < 0 || index > 3) return 0;
+  return index;
+}
+
+function applyPlayerLoadout(ws, data) {
+  applyPlayerName(ws, data);
+  const client = clients.get(ws);
+  if (!client) return;
+  if (data.tank_index != null) {
+    client.tankIndex = normalizeTankIndex(data.tank_index);
+  }
 }
 
 function send(ws, payload) {
@@ -121,6 +136,13 @@ function getSortedPlayerNames(room) {
     .map((player) => player.displayName);
 }
 
+function getSortedTankIndices(room) {
+  return room.players
+    .slice()
+    .sort((a, b) => a.playerIndex - b.playerIndex)
+    .map((player) => normalizeTankIndex(player.tankIndex));
+}
+
 function normalizeTurnCells(raw) {
   if (!Array.isArray(raw) || raw.length === 0) return null;
   if (typeof raw[0] === "number") {
@@ -209,6 +231,7 @@ function tryStartGame(room) {
   room.tankPositions = DEFAULT_TANK_POSITIONS.map((pos) => [...pos]);
   const firstAttacker = Math.floor(Math.random() * 2);
   const playerNames = getSortedPlayerNames(room);
+  const tankIndices = getSortedTankIndices(room);
   for (const player of room.players) {
     send(player.ws, {
       type: "game_start",
@@ -217,6 +240,7 @@ function tryStartGame(room) {
       player_index: player.playerIndex,
       first_attacker: firstAttacker,
       player_names: playerNames,
+      tank_indices: tankIndices,
       is_random: Boolean(room.isRandom),
     });
   }
@@ -255,7 +279,8 @@ function joinPlayerToRoom(ws, room, playerIndex) {
   }
 
   const displayName = normalizePlayerName(client.displayName);
-  room.players.push({ ws, playerIndex, displayName });
+  const tankIndex = normalizeTankIndex(client.tankIndex);
+  room.players.push({ ws, playerIndex, displayName, tankIndex });
   client.roomId = room.id;
   client.playerIndex = playerIndex;
 
@@ -297,7 +322,7 @@ function applyPlayerName(ws, data) {
 }
 
 function handleCreateRoom(ws, data) {
-  applyPlayerName(ws, data);
+  applyPlayerLoadout(ws, data);
   const name = (data.name || "未命名房間").trim().slice(0, 32);
   const password = (data.password || "").trim();
   const roomId = makeRoomId();
@@ -322,7 +347,7 @@ function handleCreateRoom(ws, data) {
 }
 
 function handleJoinRoom(ws, data) {
-  applyPlayerName(ws, data);
+  applyPlayerLoadout(ws, data);
   const roomId = String(data.room_id || "").trim().toUpperCase();
   const password = String(data.password || "").trim();
   const room = rooms.get(roomId);
@@ -346,7 +371,7 @@ function handleJoinRoom(ws, data) {
 }
 
 function handleJoinRandom(ws, data) {
-  applyPlayerName(ws, data);
+  applyPlayerLoadout(ws, data);
   removeFromQueue(ws);
   leaveRoom(ws);
   if (!matchQueue.includes(ws)) {
@@ -357,7 +382,7 @@ function handleJoinRandom(ws, data) {
 }
 
 function handleAnnouncePlayerName(ws, data) {
-  applyPlayerName(ws, data);
+  applyPlayerLoadout(ws, data);
   const client = clients.get(ws);
   if (!client || !client.roomId) return;
 
@@ -367,6 +392,7 @@ function handleAnnouncePlayerName(ws, data) {
   const player = room.players.find((entry) => entry.ws === ws);
   if (player) {
     player.displayName = normalizePlayerName(client.displayName);
+    player.tankIndex = normalizeTankIndex(client.tankIndex);
   }
 
   broadcastAll(room, {
@@ -457,6 +483,7 @@ wss.on("connection", (ws) => {
     roomId: null,
     playerIndex: -1,
     displayName: "玩家",
+    tankIndex: 0,
   });
 
   send(ws, { type: "connected", client_id: clientId, server_version: SERVER_VERSION });
