@@ -2,7 +2,11 @@ const http = require("http");
 const { WebSocketServer } = require("ws");
 
 const PORT = process.env.PORT || 8765;
-const SERVER_VERSION = "v22";
+const SERVER_VERSION = "v23";
+
+const DEFAULT_TANK_POSITIONS = [[6, 9], [3, 0]];
+const TURN_BACKUP_FIRST_ROUND_MS = 50000;
+const TURN_BACKUP_ROUND_MS = 35000;
 
 /** @type {Map<string, any>} */
 const rooms = new Map();
@@ -88,6 +92,7 @@ function leaveRoom(ws) {
   }
 
   if (room.players.length === 0) {
+    clearTurnTimer(room);
     rooms.delete(room.id);
   }
 
@@ -116,10 +121,72 @@ function getSortedPlayerNames(room) {
     .map((player) => player.displayName);
 }
 
+function clearTurnTimer(room) {
+  if (!room || !room.turnTimer) return;
+  clearTimeout(room.turnTimer);
+  room.turnTimer = null;
+}
+
+function startTurnBackupTimer(room, isFirstRound) {
+  clearTurnTimer(room);
+  if (!room.isRandom || room.state !== "playing") return;
+  const delay = isFirstRound ? TURN_BACKUP_FIRST_ROUND_MS : TURN_BACKUP_ROUND_MS;
+  room.turnTimer = setTimeout(() => handleTurnTimeout(room), delay);
+}
+
+function handleTurnTimeout(room) {
+  room.turnTimer = null;
+  if (!room || room.state !== "playing") return;
+
+  let changed = false;
+  for (let i = 0; i < 2; i++) {
+    const turn = room.turns[i] || {};
+    if (!turn.move || !turn.shoot) {
+      const pos = room.tankPositions[i];
+      room.turns[i] = {
+        move: [pos[0], pos[1]],
+        shoot: [pos[0], pos[1]],
+      };
+      changed = true;
+    }
+  }
+
+  if (!changed) return;
+
+  const submitted = room.turns.filter((turn) => turn.move && turn.shoot).length;
+  broadcastAll(room, {
+    type: "turn_status",
+    submitted,
+    total: 2,
+  });
+  tryExecuteRound(room);
+}
+
+function tryExecuteRound(room) {
+  const submitted = room.turns.filter((turn) => turn.move && turn.shoot).length;
+  if (submitted < 2) return;
+
+  for (let i = 0; i < 2; i++) {
+    room.tankPositions[i] = [...room.turns[i].move];
+  }
+
+  broadcastAll(room, {
+    type: "round_execute",
+    turns: room.turns.map((turn) => ({
+      move: turn.move,
+      shoot: turn.shoot,
+    })),
+  });
+
+  room.turns = [{}, {}];
+  startTurnBackupTimer(room, false);
+}
+
 function tryStartGame(room) {
   if (room.players.length < 2 || room.state !== "waiting") return;
   room.state = "playing";
   room.turns = [{}, {}];
+  room.tankPositions = DEFAULT_TANK_POSITIONS.map((pos) => [...pos]);
   const firstAttacker = Math.floor(Math.random() * 2);
   const playerNames = getSortedPlayerNames(room);
   for (const player of room.players) {
@@ -130,8 +197,10 @@ function tryStartGame(room) {
       player_index: player.playerIndex,
       first_attacker: firstAttacker,
       player_names: playerNames,
+      is_random: Boolean(room.isRandom),
     });
   }
+  startTurnBackupTimer(room, true);
 }
 
 function tryMatchRandom() {
@@ -146,6 +215,7 @@ function tryMatchRandom() {
       state: "waiting",
       turns: [{}, {}],
       players: [],
+      isRandom: true,
     };
     rooms.set(roomId, room);
     joinPlayerToRoom(wsA, room, 0);
@@ -218,6 +288,7 @@ function handleCreateRoom(ws, data) {
     state: "waiting",
     turns: [{}, {}],
     players: [],
+    isRandom: false,
   };
   rooms.set(roomId, room);
   leaveRoom(ws);
@@ -336,6 +407,10 @@ function handleSubmitTurn(ws, data) {
   }
 
   const index = client.playerIndex;
+  if (room.turns[index].move && room.turns[index].shoot) {
+    return;
+  }
+
   room.turns[index] = {
     move: [Number(move[0]), Number(move[1])],
     shoot: [Number(shoot[0]), Number(shoot[1])],
@@ -348,17 +423,7 @@ function handleSubmitTurn(ws, data) {
     total: 2,
   });
 
-  if (submitted < 2) return;
-
-  broadcastAll(room, {
-    type: "round_execute",
-    turns: room.turns.map((turn) => ({
-      move: turn.move,
-      shoot: turn.shoot,
-    })),
-  });
-
-  room.turns = [{}, {}];
+  tryExecuteRound(room);
 }
 
 const server = http.createServer((_req, res) => {
