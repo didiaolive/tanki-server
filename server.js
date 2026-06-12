@@ -2,7 +2,7 @@ const http = require("http");
 const { WebSocketServer } = require("ws");
 
 const PORT = process.env.PORT || 8765;
-const SERVER_VERSION = "v23";
+const SERVER_VERSION = "v24";
 
 const DEFAULT_TANK_POSITIONS = [[6, 9], [3, 0]];
 const TURN_BACKUP_FIRST_ROUND_MS = 50000;
@@ -121,6 +121,23 @@ function getSortedPlayerNames(room) {
     .map((player) => player.displayName);
 }
 
+function normalizeTurnCells(raw) {
+  if (!Array.isArray(raw) || raw.length === 0) return null;
+  if (typeof raw[0] === "number") {
+    return [[Number(raw[0]), Number(raw[1])]];
+  }
+  const cells = [];
+  for (const point of raw) {
+    if (!Array.isArray(point) || point.length < 2) return null;
+    cells.push([Number(point[0]), Number(point[1])]);
+  }
+  return cells.length > 0 ? cells : null;
+}
+
+function finalMovePoint(moveCells) {
+  return moveCells[moveCells.length - 1];
+}
+
 function clearTurnTimer(room) {
   if (!room || !room.turnTimer) return;
   clearTimeout(room.turnTimer);
@@ -144,8 +161,8 @@ function handleTurnTimeout(room) {
     if (!turn.move || !turn.shoot) {
       const pos = room.tankPositions[i];
       room.turns[i] = {
-        move: [pos[0], pos[1]],
-        shoot: [pos[0], pos[1]],
+        move: [[pos[0], pos[1]]],
+        shoot: [[pos[0], pos[1]]],
       };
       changed = true;
     }
@@ -167,7 +184,10 @@ function tryExecuteRound(room) {
   if (submitted < 2) return;
 
   for (let i = 0; i < 2; i++) {
-    room.tankPositions[i] = [...room.turns[i].move];
+    const moveCells = normalizeTurnCells(room.turns[i].move);
+    if (moveCells) {
+      room.tankPositions[i] = [...finalMovePoint(moveCells)];
+    }
   }
 
   broadcastAll(room, {
@@ -399,9 +419,9 @@ function handleSubmitTurn(ws, data) {
     return;
   }
 
-  const move = data.move;
-  const shoot = data.shoot;
-  if (!Array.isArray(move) || move.length !== 2 || !Array.isArray(shoot) || shoot.length !== 2) {
+  const move = normalizeTurnCells(data.move);
+  const shoot = normalizeTurnCells(data.shoot);
+  if (!move || !shoot) {
     sendError(ws, "回合資料格式錯誤");
     return;
   }
@@ -411,10 +431,7 @@ function handleSubmitTurn(ws, data) {
     return;
   }
 
-  room.turns[index] = {
-    move: [Number(move[0]), Number(move[1])],
-    shoot: [Number(shoot[0]), Number(shoot[1])],
-  };
+  room.turns[index] = { move, shoot };
 
   const submitted = room.turns.filter((turn) => turn.move && turn.shoot).length;
   broadcastAll(room, {
