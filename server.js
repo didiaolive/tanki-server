@@ -4,7 +4,7 @@ const path = require("path");
 const { WebSocketServer } = require("ws");
 
 const PORT = process.env.PORT || 8765;
-const SERVER_VERSION = "v28";
+const SERVER_VERSION = "v29";
 const LEADERBOARD_FILE = path.join(__dirname, "leaderboard_data.json");
 const TANK_DISPLAY_NAMES = ["虎式", "183", "T-34-85", "M41D"];
 
@@ -118,22 +118,36 @@ function recordAiPlayerResult(leaderboard, playerName, tankIndex, won, isDraw) {
   recordModePlayerResult(leaderboard.ai, playerName, tankIndex, won, isDraw);
 }
 
-function isNameTakenByOther(name, clientId) {
-  const normalized = normalizePlayerName(name);
-  for (const [, client] of clients) {
-    if (client.id === clientId) continue;
-    if (normalizePlayerName(client.displayName) === normalized) {
-      return true;
+function pruneDeadClients() {
+  for (const [ws] of clients) {
+    if (ws.readyState !== ws.OPEN) {
+      removeFromQueue(ws);
+      leaveRoom(ws);
+      clients.delete(ws);
     }
   }
-  return false;
 }
 
 function trySetClientName(client, rawName) {
+  pruneDeadClients();
   const name = normalizePlayerName(rawName);
-  if (isNameTakenByOther(name, client.id)) {
-    return { ok: false, message: `名稱「${name}」已被使用，請換一個` };
+
+  if (client.ownerToken) {
+    for (const [, other] of clients) {
+      if (other.id === client.id) continue;
+      if (other.ownerToken === client.ownerToken) {
+        other.displayName = "玩家";
+      }
+    }
   }
+
+  for (const [ws, other] of clients) {
+    if (other.id === client.id) continue;
+    if (ws.readyState !== ws.OPEN) continue;
+    if (normalizePlayerName(other.displayName) !== name) continue;
+    return { ok: false, message: `名稱「${name}」已被其他玩家使用，請換一個` };
+  }
+
   client.displayName = name;
   return { ok: true, name };
 }
@@ -141,6 +155,11 @@ function trySetClientName(client, rawName) {
 function handleReservePlayerName(ws, data) {
   const client = clients.get(ws);
   if (!client) return;
+
+  if (data.client_token != null) {
+    const token = String(data.client_token).trim().slice(0, 64);
+    client.ownerToken = token || null;
+  }
 
   const result = trySetClientName(client, data.player_name);
   if (!result.ok) {
@@ -716,6 +735,7 @@ wss.on("connection", (ws) => {
     playerIndex: -1,
     displayName: "玩家",
     tankIndex: 0,
+    ownerToken: null,
   });
 
   send(ws, { type: "connected", client_id: clientId, server_version: SERVER_VERSION });
