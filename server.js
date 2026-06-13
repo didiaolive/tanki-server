@@ -4,9 +4,17 @@ const path = require("path");
 const { WebSocketServer } = require("ws");
 
 const PORT = process.env.PORT || 8765;
-const SERVER_VERSION = "v29";
+const SERVER_VERSION = "v30";
 const LEADERBOARD_FILE = path.join(__dirname, "leaderboard_data.json");
 const TANK_DISPLAY_NAMES = ["虎式", "183", "T-34-85", "M41D"];
+const TANK_ROLE_NAMES = ["重型", "驅逐", "中型", "輕型"];
+// 目標克制鏈：重>中>輕>驅逐>重（索引 0>2>3>1>0）
+const IDEAL_ADVANTAGE_PAIRS = [
+  [0, 2],
+  [2, 3],
+  [3, 1],
+  [1, 0],
+];
 
 const DEFAULT_TANK_POSITIONS = [[6, 9], [3, 0]];
 const TURN_BACKUP_FIRST_ROUND_MS = 50000;
@@ -42,17 +50,44 @@ function normalizeTankIndex(raw) {
   return index;
 }
 
+function defaultMatchupMatrix() {
+  return Array.from({ length: 4 }, () =>
+    Array.from({ length: 4 }, () => ({ wins: 0, losses: 0, draws: 0 }))
+  );
+}
+
 function defaultLeaderboard() {
   return {
     random: {
       players: {},
       tanks: TANK_DISPLAY_NAMES.map(() => ({ wins: 0, losses: 0 })),
+      matchups: defaultMatchupMatrix(),
     },
     ai: {
       players: {},
       tanks: TANK_DISPLAY_NAMES.map(() => ({ wins: 0, losses: 0 })),
+      matchups: defaultMatchupMatrix(),
     },
   };
+}
+
+function ensureMatchupMatrix(raw) {
+  const matrix = defaultMatchupMatrix();
+  if (!Array.isArray(raw) || raw.length !== 4) return matrix;
+  for (let a = 0; a < 4; a++) {
+    if (!Array.isArray(raw[a]) || raw[a].length !== 4) return matrix;
+    for (let b = 0; b < 4; b++) {
+      const cell = raw[a][b];
+      if (cell && typeof cell === "object") {
+        matrix[a][b] = {
+          wins: Number(cell.wins || 0),
+          losses: Number(cell.losses || 0),
+          draws: Number(cell.draws || 0),
+        };
+      }
+    }
+  }
+  return matrix;
 }
 
 function ensureLeaderboardShape(leaderboard) {
@@ -63,6 +98,7 @@ function ensureLeaderboardShape(leaderboard) {
   if (!Array.isArray(leaderboard.random.tanks) || leaderboard.random.tanks.length !== 4) {
     leaderboard.random.tanks = TANK_DISPLAY_NAMES.map(() => ({ wins: 0, losses: 0 }));
   }
+  leaderboard.random.matchups = ensureMatchupMatrix(leaderboard.random.matchups);
   if (!leaderboard.ai) {
     leaderboard.ai = defaultLeaderboard().ai;
   }
@@ -70,6 +106,7 @@ function ensureLeaderboardShape(leaderboard) {
   if (!Array.isArray(leaderboard.ai.tanks) || leaderboard.ai.tanks.length !== 4) {
     leaderboard.ai.tanks = TANK_DISPLAY_NAMES.map(() => ({ wins: 0, losses: 0 }));
   }
+  leaderboard.ai.matchups = ensureMatchupMatrix(leaderboard.ai.matchups);
   return leaderboard;
 }
 
@@ -107,6 +144,25 @@ function recordModePlayerResult(bucket, playerName, tankIndex, won, isDraw) {
   if (!isDraw) {
     if (won) tank.wins += 1;
     else tank.losses += 1;
+  }
+}
+
+function recordTankMatchup(bucket, tankA, tankB, aWon, isDraw) {
+  const a = normalizeTankIndex(tankA);
+  const b = normalizeTankIndex(tankB);
+  if (a === b) return;
+  if (!bucket.matchups) bucket.matchups = defaultMatchupMatrix();
+  bucket.matchups = ensureMatchupMatrix(bucket.matchups);
+  if (isDraw) {
+    bucket.matchups[a][b].draws += 1;
+    return;
+  }
+  if (aWon) {
+    bucket.matchups[a][b].wins += 1;
+    bucket.matchups[b][a].losses += 1;
+  } else {
+    bucket.matchups[b][a].wins += 1;
+    bucket.matchups[a][b].losses += 1;
   }
 }
 
@@ -188,6 +244,19 @@ function recordRandomRoomResult(room, winnerIndex, isDraw = false) {
       isDraw
     );
   }
+  if (room.players.length === 2) {
+    const p0 = room.players.find((p) => p.playerIndex === 0);
+    const p1 = room.players.find((p) => p.playerIndex === 1);
+    if (p0 && p1) {
+      recordTankMatchup(
+        leaderboard.random,
+        p0.tankIndex,
+        p1.tankIndex,
+        !isDraw && winnerIndex === p0.playerIndex,
+        isDraw
+      );
+    }
+  }
   saveLeaderboard(leaderboard);
 }
 
@@ -255,13 +324,25 @@ function handleReportMatchResult(ws, data) {
 
   if (mode === "ai") {
     const leaderboard = loadLeaderboard();
+    const playerTank = normalizeTankIndex(
+      data.tank_index != null ? data.tank_index : client.tankIndex
+    );
     recordAiPlayerResult(
       leaderboard,
       client.displayName,
-      data.tank_index != null ? data.tank_index : client.tankIndex,
+      playerTank,
       Boolean(data.won),
       isDraw
     );
+    if (data.opponent_tank_index != null) {
+      recordTankMatchup(
+        leaderboard.ai,
+        playerTank,
+        data.opponent_tank_index,
+        Boolean(data.won),
+        isDraw
+      );
+    }
     saveLeaderboard(leaderboard);
     return;
   }
@@ -274,13 +355,25 @@ function handleReportMatchResult(ws, data) {
   }
 
   const leaderboard = loadLeaderboard();
+  const playerTank = normalizeTankIndex(
+    data.tank_index != null ? data.tank_index : client.tankIndex
+  );
   recordRandomPlayerResult(
     leaderboard,
     client.displayName,
-    data.tank_index != null ? data.tank_index : client.tankIndex,
+    playerTank,
     Boolean(data.won),
     isDraw
   );
+  if (data.opponent_tank_index != null) {
+    recordTankMatchup(
+      leaderboard.random,
+      playerTank,
+      data.opponent_tank_index,
+      Boolean(data.won),
+      isDraw
+    );
+  }
   saveLeaderboard(leaderboard);
 }
 
@@ -720,9 +813,139 @@ function handleSubmitTurn(ws, data) {
   tryExecuteRound(room);
 }
 
-const server = http.createServer((_req, res) => {
+function mergeMatchupMatrices(a, b) {
+  const result = defaultMatchupMatrix();
+  for (let i = 0; i < 4; i++) {
+    for (let j = 0; j < 4; j++) {
+      result[i][j].wins = Number(a[i][j].wins || 0) + Number(b[i][j].wins || 0);
+      result[i][j].losses = Number(a[i][j].losses || 0) + Number(b[i][j].losses || 0);
+      result[i][j].draws = Number(a[i][j].draws || 0) + Number(b[i][j].draws || 0);
+    }
+  }
+  return result;
+}
+
+function matchupWinRate(cell) {
+  const wins = Number(cell.wins || 0);
+  const losses = Number(cell.losses || 0);
+  const total = wins + losses;
+  if (total <= 0) return null;
+  return Math.round((wins * 100) / total);
+}
+
+function formatTankLabel(index) {
+  return `${TANK_DISPLAY_NAMES[index]}（${TANK_ROLE_NAMES[index]}）`;
+}
+
+function buildMatchupSection(title, matrix) {
+  const lines = [title, ""];
+  lines.push("（列=我方車種，欄=對手車種，數字=我方勝率% / 樣本場次）");
+  lines.push("");
+  const header = ["我方＼對手", ...TANK_DISPLAY_NAMES].join("\t");
+  lines.push(header);
+  for (let mine = 0; mine < 4; mine++) {
+    const cells = [TANK_DISPLAY_NAMES[mine]];
+    for (let opp = 0; opp < 4; opp++) {
+      if (mine === opp) {
+        cells.push("—");
+        continue;
+      }
+      const cell = matrix[mine][opp];
+      const wins = Number(cell.wins || 0);
+      const losses = Number(cell.losses || 0);
+      const draws = Number(cell.draws || 0);
+      const total = wins + losses + draws;
+      const rate = matchupWinRate(cell);
+      if (rate == null) {
+        cells.push("---");
+      } else {
+        cells.push(`${rate}% (${total})`);
+      }
+    }
+    lines.push(cells.join("\t"));
+  }
+  return lines;
+}
+
+function buildIdealChainSection(matrix) {
+  const lines = ["【目標克制鏈達成度】", "重坦>中坦>輕坦>驅逐>重坦", ""];
+  for (const [attacker, defender] of IDEAL_ADVANTAGE_PAIRS) {
+    const cell = matrix[attacker][defender];
+    const rate = matchupWinRate(cell);
+    const wins = Number(cell.wins || 0);
+    const losses = Number(cell.losses || 0);
+    const total = wins + losses;
+    const label = `${formatTankLabel(attacker)} → ${formatTankLabel(defender)}`;
+    if (rate == null) {
+      lines.push(`${label}：尚無資料`);
+      continue;
+    }
+    const status = rate >= 55 ? "✓ 達標傾向" : rate >= 50 ? "≈ 接近平衡" : "✗ 未達標";
+    lines.push(`${label}：${rate}%（${wins}勝/${losses}敗） ${status}`);
+  }
+  return lines;
+}
+
+function buildBalanceReportText() {
+  const leaderboard = loadLeaderboard();
+  const randomMatrix = ensureMatchupMatrix(leaderboard.random.matchups);
+  const aiMatrix = ensureMatchupMatrix(leaderboard.ai.matchups);
+  const allMatrix = mergeMatchupMatrices(randomMatrix, aiMatrix);
+
+  const lines = [
+    "坦棋 Tanki — 車種對戰平衡報表",
+    `伺服器版本: ${SERVER_VERSION}`,
+    `資料檔: ${LEADERBOARD_FILE}`,
+    "",
+    "※ 僅統計「正常戰鬥結束」的對戰；投降、中離不列入。",
+    "",
+    ...buildMatchupSection("【全部模式合計｜車種對戰勝率】", allMatrix),
+    "",
+    ...buildIdealChainSection(allMatrix),
+    "",
+    ...buildMatchupSection("【隨機戰鬥｜車種對戰勝率】", randomMatrix),
+    "",
+    ...buildMatchupSection("【與電腦對戰｜車種對戰勝率】", aiMatrix),
+    "",
+    "各車種總勝率（隨機）：",
+  ];
+
+  for (const entry of getTop3TankWinrate(leaderboard.random.tanks)) {
+    if (entry.wins + entry.losses <= 0) continue;
+    lines.push(`  ${entry.name}：${entry.value}%（${entry.wins}勝/${entry.losses}敗）`);
+  }
+
+  lines.push("", "各車種總勝率（電腦）：");
+  for (const entry of getTop3TankWinrate(leaderboard.ai.tanks)) {
+    if (entry.wins + entry.losses <= 0) continue;
+    lines.push(`  ${entry.name}：${entry.value}%（${entry.wins}勝/${entry.losses}敗）`);
+  }
+
+  return lines.join("\n");
+}
+
+function handleBalanceReport(req, res) {
+  const requiredKey = process.env.BALANCE_REPORT_KEY || "";
+  if (requiredKey) {
+    const url = new URL(req.url || "/", "http://localhost");
+    if (url.searchParams.get("key") !== requiredKey) {
+      res.writeHead(403, { "Content-Type": "text/plain; charset=utf-8" });
+      res.end("Forbidden");
+      return;
+    }
+  }
   res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8" });
-  res.end(`坦棋 Tanki server is running.\n版本: ${SERVER_VERSION}\n`);
+  res.end(buildBalanceReportText());
+}
+
+const server = http.createServer((req, res) => {
+  const pathOnly = String(req.url || "").split("?")[0];
+  if (pathOnly === "/balance-report") {
+    handleBalanceReport(req, res);
+    return;
+  }
+  res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8" });
+  res.end(`坦棋 Tanki server is running.\n版本: ${SERVER_VERSION}\n平衡報表: /balance-report\n`);
 });
 
 const wss = new WebSocketServer({ server });
@@ -800,6 +1023,10 @@ wss.on("connection", (ws) => {
   });
 });
 
-server.listen(PORT, () => {
-  console.log(`Tanki server listening on port ${PORT}`);
-});
+if (require.main === module) {
+  server.listen(PORT, () => {
+    console.log(`Tanki server listening on port ${PORT}`);
+  });
+}
+
+module.exports = { buildBalanceReportText };
