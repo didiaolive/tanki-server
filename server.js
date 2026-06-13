@@ -1,8 +1,12 @@
 const http = require("http");
+const fs = require("fs");
+const path = require("path");
 const { WebSocketServer } = require("ws");
 
 const PORT = process.env.PORT || 8765;
-const SERVER_VERSION = "v25";
+const SERVER_VERSION = "v28";
+const LEADERBOARD_FILE = path.join(__dirname, "leaderboard_data.json");
+const TANK_DISPLAY_NAMES = ["虎式", "183", "T-34-85", "M41D"];
 
 const DEFAULT_TANK_POSITIONS = [[6, 9], [3, 0]];
 const TURN_BACKUP_FIRST_ROUND_MS = 50000;
@@ -38,13 +42,243 @@ function normalizeTankIndex(raw) {
   return index;
 }
 
-function applyPlayerLoadout(ws, data) {
-  applyPlayerName(ws, data);
+function defaultLeaderboard() {
+  return {
+    random: {
+      players: {},
+      tanks: TANK_DISPLAY_NAMES.map(() => ({ wins: 0, losses: 0 })),
+    },
+    ai: {
+      players: {},
+      tanks: TANK_DISPLAY_NAMES.map(() => ({ wins: 0, losses: 0 })),
+    },
+  };
+}
+
+function ensureLeaderboardShape(leaderboard) {
+  if (!leaderboard.random) {
+    leaderboard.random = defaultLeaderboard().random;
+  }
+  if (!leaderboard.random.players) leaderboard.random.players = {};
+  if (!Array.isArray(leaderboard.random.tanks) || leaderboard.random.tanks.length !== 4) {
+    leaderboard.random.tanks = TANK_DISPLAY_NAMES.map(() => ({ wins: 0, losses: 0 }));
+  }
+  if (!leaderboard.ai) {
+    leaderboard.ai = defaultLeaderboard().ai;
+  }
+  if (!leaderboard.ai.players) leaderboard.ai.players = {};
+  if (!Array.isArray(leaderboard.ai.tanks) || leaderboard.ai.tanks.length !== 4) {
+    leaderboard.ai.tanks = TANK_DISPLAY_NAMES.map(() => ({ wins: 0, losses: 0 }));
+  }
+  return leaderboard;
+}
+
+function loadLeaderboard() {
+  try {
+    const raw = fs.readFileSync(LEADERBOARD_FILE, "utf8");
+    return ensureLeaderboardShape(JSON.parse(raw));
+  } catch {
+    return defaultLeaderboard();
+  }
+}
+
+function saveLeaderboard(data) {
+  fs.writeFileSync(LEADERBOARD_FILE, JSON.stringify(data, null, 2), "utf8");
+}
+
+// 僅在「正常戰鬥結束」時呼叫：同時更新連勝與車種勝敗（供戰力平衡參考）。
+// 投降、中離等非正常結束不應呼叫此函式。
+function recordModePlayerResult(bucket, playerName, tankIndex, won, isDraw) {
+  const name = normalizePlayerName(playerName);
+  if (!bucket.players[name]) {
+    bucket.players[name] = { bestStreak: 0, currentStreak: 0 };
+  }
+  const player = bucket.players[name];
+  if (isDraw) {
+    player.currentStreak = 0;
+  } else if (won) {
+    player.currentStreak += 1;
+    player.bestStreak = Math.max(player.bestStreak, player.currentStreak);
+  } else {
+    player.currentStreak = 0;
+  }
+
+  const tank = bucket.tanks[normalizeTankIndex(tankIndex)];
+  if (!isDraw) {
+    if (won) tank.wins += 1;
+    else tank.losses += 1;
+  }
+}
+
+function recordRandomPlayerResult(leaderboard, playerName, tankIndex, won, isDraw) {
+  recordModePlayerResult(leaderboard.random, playerName, tankIndex, won, isDraw);
+}
+
+function recordAiPlayerResult(leaderboard, playerName, tankIndex, won, isDraw) {
+  recordModePlayerResult(leaderboard.ai, playerName, tankIndex, won, isDraw);
+}
+
+function isNameTakenByOther(name, clientId) {
+  const normalized = normalizePlayerName(name);
+  for (const [, client] of clients) {
+    if (client.id === clientId) continue;
+    if (normalizePlayerName(client.displayName) === normalized) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function trySetClientName(client, rawName) {
+  const name = normalizePlayerName(rawName);
+  if (isNameTakenByOther(name, client.id)) {
+    return { ok: false, message: `名稱「${name}」已被使用，請換一個` };
+  }
+  client.displayName = name;
+  return { ok: true, name };
+}
+
+function handleReservePlayerName(ws, data) {
   const client = clients.get(ws);
   if (!client) return;
+
+  const result = trySetClientName(client, data.player_name);
+  if (!result.ok) {
+    send(ws, { type: "name_reserved", ok: false, message: result.message });
+    return;
+  }
+
+  send(ws, {
+    type: "name_reserved",
+    ok: true,
+    player_name: result.name,
+  });
+}
+
+function recordRandomRoomResult(room, winnerIndex, isDraw = false) {
+  if (!room || !room.isRandom || room.leaderboardRecorded) return;
+  room.leaderboardRecorded = true;
+  const leaderboard = loadLeaderboard();
+  for (const player of room.players) {
+    const won = !isDraw && player.playerIndex === winnerIndex;
+    recordRandomPlayerResult(
+      leaderboard,
+      player.displayName,
+      player.tankIndex,
+      won,
+      isDraw
+    );
+  }
+  saveLeaderboard(leaderboard);
+}
+
+function getTop3Streak(players) {
+  return Object.entries(players)
+    .map(([name, stats]) => ({
+      name,
+      value: Number(stats.bestStreak || 0),
+      wins: 0,
+      losses: 0,
+    }))
+    .sort((a, b) => b.value - a.value || a.name.localeCompare(b.name))
+    .slice(0, 3);
+}
+
+function getTop3TankWinrate(tanks) {
+  return tanks
+    .map((tank, index) => {
+      const wins = Number(tank.wins || 0);
+      const losses = Number(tank.losses || 0);
+      const total = wins + losses;
+      return {
+        name: TANK_DISPLAY_NAMES[index] || `戰車${index + 1}`,
+        value: total > 0 ? Math.round((wins * 100) / total) : 0,
+        wins,
+        losses,
+      };
+    })
+    .filter((entry) => entry.wins + entry.losses > 0)
+    .sort((a, b) => b.value - a.value || b.wins - a.wins || a.name.localeCompare(b.name))
+    .slice(0, 3);
+}
+
+function padTop3(entries) {
+  const result = entries.slice(0, 3);
+  while (result.length < 3) {
+    result.push({ name: "---", value: 0, wins: 0, losses: 0 });
+  }
+  return result;
+}
+
+function buildLeaderboardPayload() {
+  const leaderboard = loadLeaderboard();
+  return {
+    type: "leaderboard",
+    random_streak_top3: padTop3(getTop3Streak(leaderboard.random.players)),
+    random_tank_top3: padTop3(getTop3TankWinrate(leaderboard.random.tanks)),
+    ai_streak_top3: padTop3(getTop3Streak(leaderboard.ai.players)),
+    ai_tank_top3: padTop3(getTop3TankWinrate(leaderboard.ai.tanks)),
+  };
+}
+
+function handleGetLeaderboard(ws) {
+  send(ws, buildLeaderboardPayload());
+}
+
+function handleReportMatchResult(ws, data) {
+  const client = clients.get(ws);
+  if (!client) return;
+  if (!data.normal_end) return;
+
+  const mode = String(data.mode || "random");
+  const isDraw = Boolean(data.is_draw);
+  const winnerIndex = Number(data.winner_index);
+
+  if (mode === "ai") {
+    const leaderboard = loadLeaderboard();
+    recordAiPlayerResult(
+      leaderboard,
+      client.displayName,
+      data.tank_index != null ? data.tank_index : client.tankIndex,
+      Boolean(data.won),
+      isDraw
+    );
+    saveLeaderboard(leaderboard);
+    return;
+  }
+
+  const room = client.roomId ? rooms.get(client.roomId) : null;
+
+  if (room && room.isRandom && room.state === "playing" && Number.isInteger(winnerIndex)) {
+    recordRandomRoomResult(room, winnerIndex, isDraw);
+    return;
+  }
+
+  const leaderboard = loadLeaderboard();
+  recordRandomPlayerResult(
+    leaderboard,
+    client.displayName,
+    data.tank_index != null ? data.tank_index : client.tankIndex,
+    Boolean(data.won),
+    isDraw
+  );
+  saveLeaderboard(leaderboard);
+}
+
+function applyPlayerLoadout(ws, data) {
+  const client = clients.get(ws);
+  if (!client) return false;
+  if (data.player_name != null) {
+    const result = trySetClientName(client, data.player_name);
+    if (!result.ok) {
+      sendError(ws, result.message);
+      return false;
+    }
+  }
   if (data.tank_index != null) {
     client.tankIndex = normalizeTankIndex(data.tank_index);
   }
+  return true;
 }
 
 function send(ws, payload) {
@@ -229,6 +463,7 @@ function tryStartGame(room) {
   room.state = "playing";
   room.turns = [{}, {}];
   room.tankPositions = DEFAULT_TANK_POSITIONS.map((pos) => [...pos]);
+  room.leaderboardRecorded = false;
   const firstAttacker = Math.floor(Math.random() * 2);
   const playerNames = getSortedPlayerNames(room);
   const tankIndices = getSortedTankIndices(room);
@@ -314,15 +549,11 @@ function joinPlayerToRoom(ws, room, playerIndex) {
 }
 
 function applyPlayerName(ws, data) {
-  const client = clients.get(ws);
-  if (!client) return;
-  if (data.player_name != null) {
-    client.displayName = normalizePlayerName(data.player_name);
-  }
+  return applyPlayerLoadout(ws, data);
 }
 
 function handleCreateRoom(ws, data) {
-  applyPlayerLoadout(ws, data);
+  if (!applyPlayerLoadout(ws, data)) return;
   const name = (data.name || "未命名房間").trim().slice(0, 32);
   const password = (data.password || "").trim();
   const roomId = makeRoomId();
@@ -347,7 +578,7 @@ function handleCreateRoom(ws, data) {
 }
 
 function handleJoinRoom(ws, data) {
-  applyPlayerLoadout(ws, data);
+  if (!applyPlayerLoadout(ws, data)) return;
   const roomId = String(data.room_id || "").trim().toUpperCase();
   const password = String(data.password || "").trim();
   const room = rooms.get(roomId);
@@ -371,7 +602,7 @@ function handleJoinRoom(ws, data) {
 }
 
 function handleJoinRandom(ws, data) {
-  applyPlayerLoadout(ws, data);
+  if (!applyPlayerLoadout(ws, data)) return;
   removeFromQueue(ws);
   leaveRoom(ws);
   if (!matchQueue.includes(ws)) {
@@ -382,9 +613,10 @@ function handleJoinRandom(ws, data) {
 }
 
 function handleAnnouncePlayerName(ws, data) {
-  applyPlayerLoadout(ws, data);
   const client = clients.get(ws);
   if (!client || !client.roomId) return;
+
+  if (!applyPlayerLoadout(ws, data)) return;
 
   const room = rooms.get(client.roomId);
   if (!room) return;
@@ -526,6 +758,15 @@ wss.on("connection", (ws) => {
         break;
       case "announce_player_name":
         handleAnnouncePlayerName(ws, data);
+        break;
+      case "reserve_player_name":
+        handleReservePlayerName(ws, data);
+        break;
+      case "get_leaderboard":
+        handleGetLeaderboard(ws);
+        break;
+      case "report_match_result":
+        handleReportMatchResult(ws, data);
         break;
       default:
         sendError(ws, `未知指令: ${data.type}`);
