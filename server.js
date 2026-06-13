@@ -2,11 +2,15 @@ const http = require("http");
 const fs = require("fs");
 const path = require("path");
 const { WebSocketServer } = require("ws");
+const {
+  TANK_DISPLAY_NAMES,
+  defaultMatchupMatrix,
+  ensureMatchupMatrix,
+} = require("./leaderboard_schema");
+const lbStore = require("./leaderboard_store");
 
 const PORT = process.env.PORT || 8765;
-const SERVER_VERSION = "v30";
-const LEADERBOARD_FILE = path.join(__dirname, "leaderboard_data.json");
-const TANK_DISPLAY_NAMES = ["虎式", "183", "T-34-85", "M41D"];
+const SERVER_VERSION = "v31";
 const TANK_ROLE_NAMES = ["重型", "驅逐", "中型", "輕型"];
 // 目標克制鏈：重>中>輕>驅逐>重（索引 0>2>3>1>0）
 const IDEAL_ADVANTAGE_PAIRS = [
@@ -50,77 +54,12 @@ function normalizeTankIndex(raw) {
   return index;
 }
 
-function defaultMatchupMatrix() {
-  return Array.from({ length: 4 }, () =>
-    Array.from({ length: 4 }, () => ({ wins: 0, losses: 0, draws: 0 }))
-  );
-}
-
-function defaultLeaderboard() {
-  return {
-    random: {
-      players: {},
-      tanks: TANK_DISPLAY_NAMES.map(() => ({ wins: 0, losses: 0 })),
-      matchups: defaultMatchupMatrix(),
-    },
-    ai: {
-      players: {},
-      tanks: TANK_DISPLAY_NAMES.map(() => ({ wins: 0, losses: 0 })),
-      matchups: defaultMatchupMatrix(),
-    },
-  };
-}
-
-function ensureMatchupMatrix(raw) {
-  const matrix = defaultMatchupMatrix();
-  if (!Array.isArray(raw) || raw.length !== 4) return matrix;
-  for (let a = 0; a < 4; a++) {
-    if (!Array.isArray(raw[a]) || raw[a].length !== 4) return matrix;
-    for (let b = 0; b < 4; b++) {
-      const cell = raw[a][b];
-      if (cell && typeof cell === "object") {
-        matrix[a][b] = {
-          wins: Number(cell.wins || 0),
-          losses: Number(cell.losses || 0),
-          draws: Number(cell.draws || 0),
-        };
-      }
-    }
-  }
-  return matrix;
-}
-
-function ensureLeaderboardShape(leaderboard) {
-  if (!leaderboard.random) {
-    leaderboard.random = defaultLeaderboard().random;
-  }
-  if (!leaderboard.random.players) leaderboard.random.players = {};
-  if (!Array.isArray(leaderboard.random.tanks) || leaderboard.random.tanks.length !== 4) {
-    leaderboard.random.tanks = TANK_DISPLAY_NAMES.map(() => ({ wins: 0, losses: 0 }));
-  }
-  leaderboard.random.matchups = ensureMatchupMatrix(leaderboard.random.matchups);
-  if (!leaderboard.ai) {
-    leaderboard.ai = defaultLeaderboard().ai;
-  }
-  if (!leaderboard.ai.players) leaderboard.ai.players = {};
-  if (!Array.isArray(leaderboard.ai.tanks) || leaderboard.ai.tanks.length !== 4) {
-    leaderboard.ai.tanks = TANK_DISPLAY_NAMES.map(() => ({ wins: 0, losses: 0 }));
-  }
-  leaderboard.ai.matchups = ensureMatchupMatrix(leaderboard.ai.matchups);
-  return leaderboard;
-}
-
 function loadLeaderboard() {
-  try {
-    const raw = fs.readFileSync(LEADERBOARD_FILE, "utf8");
-    return ensureLeaderboardShape(JSON.parse(raw));
-  } catch {
-    return defaultLeaderboard();
-  }
+  return lbStore.loadLeaderboard();
 }
 
 function saveLeaderboard(data) {
-  fs.writeFileSync(LEADERBOARD_FILE, JSON.stringify(data, null, 2), "utf8");
+  lbStore.saveLeaderboard(data);
 }
 
 // 僅在「正常戰鬥結束」時呼叫：同時更新連勝與車種勝敗（供戰力平衡參考）。
@@ -888,6 +827,7 @@ function buildIdealChainSection(matrix) {
 
 function buildBalanceReportText() {
   const leaderboard = loadLeaderboard();
+  const persistence = lbStore.getPersistenceStatus();
   const randomMatrix = ensureMatchupMatrix(leaderboard.random.matchups);
   const aiMatrix = ensureMatchupMatrix(leaderboard.ai.matchups);
   const allMatrix = mergeMatchupMatrices(randomMatrix, aiMatrix);
@@ -895,7 +835,9 @@ function buildBalanceReportText() {
   const lines = [
     "坦棋 Tanki — 車種對戰平衡報表",
     `伺服器版本: ${SERVER_VERSION}`,
-    `資料檔: ${LEADERBOARD_FILE}`,
+    `本機快取: ${persistence.file}`,
+    `雲端持久化: ${persistence.cloudEnabled ? "已啟用" : "未設定"}`,
+    `載入來源: ${persistence.source}`,
     "",
     "※ 僅統計「正常戰鬥結束」的對戰；投降、中離不列入。",
     "",
@@ -944,8 +886,14 @@ const server = http.createServer((req, res) => {
     handleBalanceReport(req, res);
     return;
   }
+  const persistence = lbStore.getPersistenceStatus();
   res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8" });
-  res.end(`坦棋 Tanki server is running.\n版本: ${SERVER_VERSION}\n平衡報表: /balance-report\n`);
+  res.end(
+    `坦棋 Tanki server is running.\n版本: ${SERVER_VERSION}\n` +
+      `排行榜持久化: ${persistence.cloudEnabled ? "Supabase 已啟用" : "僅本機檔案"}\n` +
+      `載入來源: ${persistence.source}\n` +
+      `平衡報表: /balance-report\n`
+  );
 });
 
 const wss = new WebSocketServer({ server });
@@ -1024,9 +972,23 @@ wss.on("connection", (ws) => {
 });
 
 if (require.main === module) {
-  server.listen(PORT, () => {
-    console.log(`Tanki server listening on port ${PORT}`);
-  });
+  lbStore
+    .initLeaderboardStore()
+    .then((status) => {
+      console.log(
+        `[Leaderboard] 載入完成 source=${status.source} cloud=${status.cloudEnabled}`
+      );
+      if (status.lastCloudError) {
+        console.warn(`[Leaderboard] 雲端警告: ${status.lastCloudError}`);
+      }
+      server.listen(PORT, () => {
+        console.log(`Tanki server listening on port ${PORT}`);
+      });
+    })
+    .catch((err) => {
+      console.error("[Leaderboard] 初始化失敗:", err);
+      process.exit(1);
+    });
 }
 
 module.exports = { buildBalanceReportText };
