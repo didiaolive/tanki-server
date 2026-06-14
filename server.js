@@ -10,7 +10,7 @@ const {
 const lbStore = require("./leaderboard_store");
 
 const PORT = process.env.PORT || 8765;
-const SERVER_VERSION = "v31";
+const SERVER_VERSION = "v32";
 const TANK_ROLE_NAMES = ["重型", "驅逐", "中型", "輕型"];
 // 目標克制鏈：重>中>輕>驅逐>重（索引 0>2>3>1>0）
 const IDEAL_ADVANTAGE_PAIRS = [
@@ -752,6 +752,49 @@ function handleSubmitTurn(ws, data) {
   tryExecuteRound(room);
 }
 
+function handleTreasureSpawn(ws, data) {
+  const client = clients.get(ws);
+  if (!client || !client.roomId) {
+    sendError(ws, "尚未加入房間");
+    return;
+  }
+
+  const room = rooms.get(client.roomId);
+  if (!room || room.state !== "playing") {
+    sendError(ws, "對戰尚未開始");
+    return;
+  }
+
+  if (client.playerIndex !== 0) {
+    sendError(ws, "僅 0 號玩家可同步寶藏位置");
+    return;
+  }
+
+  const kind = String(data.kind || "");
+  if (kind !== "bonus" && kind !== "respawn") {
+    sendError(ws, "寶藏類型無效");
+    return;
+  }
+
+  const round = Number(data.round);
+  if (!Number.isInteger(round) || round < 0) {
+    sendError(ws, "回合編號無效");
+    return;
+  }
+
+  const x = Number(data.x);
+  const y = Number(data.y);
+  const hasCell = Number.isInteger(x) && Number.isInteger(y) && x >= 0 && y >= 0;
+
+  broadcastAll(room, {
+    type: "treasure_spawn",
+    kind,
+    round,
+    x: hasCell ? x : -1,
+    y: hasCell ? y : -1,
+  });
+}
+
 function mergeMatchupMatrices(a, b) {
   const result = defaultMatchupMatrix();
   for (let i = 0; i < 4; i++) {
@@ -943,6 +986,9 @@ wss.on("connection", (ws) => {
         break;
       case "submit_turn":
         handleSubmitTurn(ws, data);
+        break;
+      case "treasure_spawn":
+        handleTreasureSpawn(ws, data);
         break;
       case "surrender":
         handleSurrender(ws);
