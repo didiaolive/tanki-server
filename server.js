@@ -199,7 +199,7 @@ function recordRandomRoomResult(room, winnerIndex, isDraw = false) {
   saveLeaderboard(leaderboard);
 }
 
-function getTop3Streak(players) {
+function getTop10Streak(players) {
   return Object.entries(players)
     .map(([name, stats]) => ({
       name,
@@ -208,10 +208,14 @@ function getTop3Streak(players) {
       losses: 0,
     }))
     .sort((a, b) => b.value - a.value || a.name.localeCompare(b.name))
-    .slice(0, 3);
+    .slice(0, 10);
 }
 
-function getTop3TankWinrate(tanks) {
+function getTop3Streak(players) {
+  return getTop10Streak(players).slice(0, 3);
+}
+
+function getAllTankWinrate(tanks) {
   return tanks
     .map((tank, index) => {
       const wins = Number(tank.wins || 0);
@@ -224,17 +228,44 @@ function getTop3TankWinrate(tanks) {
         losses,
       };
     })
+    .sort((a, b) => {
+      const aTotal = a.wins + a.losses;
+      const bTotal = b.wins + b.losses;
+      if (aTotal <= 0 && bTotal <= 0) return a.name.localeCompare(b.name);
+      if (aTotal <= 0) return 1;
+      if (bTotal <= 0) return -1;
+      return b.value - a.value || b.wins - a.wins || a.name.localeCompare(b.name);
+    });
+}
+
+function getTop3TankWinrate(tanks) {
+  return getAllTankWinrate(tanks)
     .filter((entry) => entry.wins + entry.losses > 0)
-    .sort((a, b) => b.value - a.value || b.wins - a.wins || a.name.localeCompare(b.name))
     .slice(0, 3);
 }
 
-function padTop3(entries) {
-  const result = entries.slice(0, 3);
-  while (result.length < 3) {
+function padTopN(entries, count) {
+  const result = entries.slice(0, count);
+  while (result.length < count) {
     result.push({ name: "---", value: 0, wins: 0, losses: 0 });
   }
   return result;
+}
+
+function getPlayerStreaks(playerNames, bucketKey) {
+  const leaderboard = loadLeaderboard();
+  const bucket = leaderboard[bucketKey];
+  if (!bucket || !bucket.players) {
+    return playerNames.map(() => 0);
+  }
+  return playerNames.map((name) => {
+    const player = bucket.players[normalizePlayerName(name)];
+    return player ? Number(player.currentStreak || 0) : 0;
+  });
+}
+
+function padTop3(entries) {
+  return padTopN(entries, 3);
 }
 
 function buildLeaderboardPayload() {
@@ -242,9 +273,13 @@ function buildLeaderboardPayload() {
   return {
     type: "leaderboard",
     random_streak_top3: padTop3(getTop3Streak(leaderboard.random.players)),
+    random_streak_top10: padTopN(getTop10Streak(leaderboard.random.players), 10),
     random_tank_top3: padTop3(getTop3TankWinrate(leaderboard.random.tanks)),
+    random_tank_all: getAllTankWinrate(leaderboard.random.tanks),
     ai_streak_top3: padTop3(getTop3Streak(leaderboard.ai.players)),
+    ai_streak_top10: padTopN(getTop10Streak(leaderboard.ai.players), 10),
     ai_tank_top3: padTop3(getTop3TankWinrate(leaderboard.ai.tanks)),
+    ai_tank_all: getAllTankWinrate(leaderboard.ai.tanks),
   };
 }
 
@@ -519,7 +554,7 @@ function tryStartGame(room) {
   const playerNames = getSortedPlayerNames(room);
   const tankIndices = getSortedTankIndices(room);
   for (const player of room.players) {
-    send(player.ws, {
+    const payload = {
       type: "game_start",
       room_id: room.id,
       players: room.players.length,
@@ -528,7 +563,11 @@ function tryStartGame(room) {
       player_names: playerNames,
       tank_indices: tankIndices,
       is_random: Boolean(room.isRandom),
-    });
+    };
+    if (room.isRandom) {
+      payload.player_streaks = getPlayerStreaks(playerNames, "random");
+    }
+    send(player.ws, payload);
   }
   startTurnBackupTimer(room, true);
 }
