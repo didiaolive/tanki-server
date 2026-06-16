@@ -810,7 +810,7 @@ function handleTreasureSpawn(ws, data) {
   }
 
   const kind = String(data.kind || "");
-  if (kind !== "bonus" && kind !== "respawn") {
+  if (kind !== "bonus" && kind !== "respawn" && kind !== "supply") {
     sendError(ws, "寶藏類型無效");
     return;
   }
