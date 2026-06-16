@@ -10,7 +10,7 @@ const {
 const lbStore = require("./leaderboard_store");
 
 const PORT = process.env.PORT || 8765;
-const SERVER_VERSION = "v36";
+const SERVER_VERSION = "v37";
 const TANK_ROLE_NAMES = ["重型", "驅逐", "中型", "輕型"];
 // 目標克制鏈：重>中>輕>驅逐>重（索引 0>2>3>1>0）
 const IDEAL_ADVANTAGE_PAIRS = [
@@ -834,6 +834,32 @@ function handleTreasureSpawn(ws, data) {
   });
 }
 
+function handleSupplyArm(ws, data) {
+  const client = clients.get(ws);
+  if (!client || !client.roomId) {
+    sendError(ws, "尚未加入房間");
+    return;
+  }
+
+  const room = rooms.get(client.roomId);
+  if (!room || room.state !== "playing") {
+    sendError(ws, "對戰尚未開始");
+    return;
+  }
+
+  const typeId = String(data.type_id || data.type || "").trim();
+  if (typeId !== "double_damage" && typeId !== "reactive_armor") {
+    sendError(ws, "補給類型無效");
+    return;
+  }
+
+  broadcastAll(room, {
+    type: "supply_armed",
+    player_index: client.playerIndex,
+    type_id: typeId,
+  });
+}
+
 function mergeMatchupMatrices(a, b) {
   const result = defaultMatchupMatrix();
   for (let i = 0; i < 4; i++) {
@@ -1028,6 +1054,9 @@ wss.on("connection", (ws) => {
         break;
       case "treasure_spawn":
         handleTreasureSpawn(ws, data);
+        break;
+      case "supply_arm":
+        handleSupplyArm(ws, data);
         break;
       case "surrender":
         handleSurrender(ws);
