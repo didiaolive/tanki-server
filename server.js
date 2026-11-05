@@ -10,7 +10,7 @@ const {
 const lbStore = require("./leaderboard_store");
 
 const PORT = process.env.PORT || 8765;
-const SERVER_VERSION = "v37";
+const SERVER_VERSION = "v39";
 const TANK_ROLE_NAMES = ["重型", "驅逐", "中型", "輕型"];
 // 目標克制鏈：重>中>輕>驅逐>重（索引 0>2>3>1>0）
 const IDEAL_ADVANTAGE_PAIRS = [
@@ -848,16 +848,122 @@ function handleSupplyArm(ws, data) {
   }
 
   const typeId = String(data.type_id || data.type || "").trim();
-  if (typeId !== "double_damage" && typeId !== "reactive_armor") {
+  const allowedSupplyTypes = new Set([
+    "double_damage",
+    "reactive_armor",
+    "super_boost",
+    "medkit",
+    "stop_mine",
+    "blast_mine",
+    "emergency_switch",
+  ]);
+  if (!allowedSupplyTypes.has(typeId)) {
     sendError(ws, "補給類型無效");
     return;
   }
+
+  const ready = data.ready !== false && data.ready !== 0 && data.ready !== "0";
+  const reviseAttacker =
+    typeId === "super_boost"
+    && ready
+    && (data.revise_attacker === true || data.revise_attacker === 1 || data.revise_attacker === "1");
+
+  // 守方啟用加速且要求攻方重選：清掉另一方已提交的回合，允許重新 submit
+  if (reviseAttacker) {
+    const otherIndex = client.playerIndex === 0 ? 1 : 0;
+    if (room.turns && room.turns[otherIndex]) {
+      room.turns[otherIndex] = {};
+    }
+  }
+
+  const submitted = room.turns
+    ? room.turns.filter((turn) => turn && turn.move && turn.shoot).length
+    : 0;
 
   broadcastAll(room, {
     type: "supply_armed",
     player_index: client.playerIndex,
     type_id: typeId,
+    ready,
+    revise_attacker: reviseAttacker,
   });
+
+  if (reviseAttacker) {
+    broadcastAll(room, {
+      type: "turn_status",
+      submitted,
+      total: 2,
+    });
+  }
+}
+
+function handleSupplyReplaceChoice(ws, data) {
+  const client = clients.get(ws);
+  if (!client || client.roomId == null) {
+    sendError(ws, "尚未加入房間");
+    return;
+  }
+  const room = rooms.get(client.roomId);
+  if (!room || room.state !== "playing") {
+    sendError(ws, "對戰尚未開始");
+    return;
+  }
+
+  let choice = String(data.choice || "").trim();
+  if (
+    choice !== "replace_0"
+    && choice !== "replace_1"
+    && choice !== "replace_2"
+    && choice !== "abandon"
+  ) {
+    choice = "replace_0";
+  }
+
+  broadcastAll(room, {
+    type: "supply_replace_choice",
+    player_index: client.playerIndex,
+    choice,
+  });
+}
+
+function handleSupplyInstant(ws, data) {
+  const client = clients.get(ws);
+  if (!client || client.roomId == null) {
+    sendError(ws, "尚未加入房間");
+    return;
+  }
+  const room = rooms.get(client.roomId);
+  if (!room || room.state !== "playing") {
+    sendError(ws, "對戰尚未開始");
+    return;
+  }
+
+  const typeId = String(data.type_id || "").trim();
+  const allowedInstantTypes = new Set([
+    "medkit",
+    "stop_mine",
+    "blast_mine",
+    "emergency_switch",
+  ]);
+  if (!allowedInstantTypes.has(typeId)) {
+    sendError(ws, "即時補給類型無效");
+    return;
+  }
+
+  const payload = {
+    type: "supply_instant",
+    player_index: client.playerIndex,
+    type_id: typeId,
+    slot_index: Number.isInteger(Number(data.slot_index)) ? Number(data.slot_index) : -1,
+  };
+  if (Number.isInteger(Number(data.x)) && Number.isInteger(Number(data.y))) {
+    payload.x = Number(data.x);
+    payload.y = Number(data.y);
+  }
+  if (Number.isInteger(Number(data.switch_slot))) {
+    payload.switch_slot = Number(data.switch_slot);
+  }
+  broadcastAll(room, payload);
 }
 
 function mergeMatchupMatrices(a, b) {
@@ -1057,6 +1163,12 @@ wss.on("connection", (ws) => {
         break;
       case "supply_arm":
         handleSupplyArm(ws, data);
+        break;
+      case "supply_instant":
+        handleSupplyInstant(ws, data);
+        break;
+      case "supply_replace_choice":
+        handleSupplyReplaceChoice(ws, data);
         break;
       case "surrender":
         handleSurrender(ws);
