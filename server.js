@@ -10,7 +10,7 @@ const {
 const lbStore = require("./leaderboard_store");
 
 const PORT = process.env.PORT || 8765;
-const SERVER_VERSION = "v39";
+const SERVER_VERSION = "v41";
 const TANK_ROLE_NAMES = ["重型", "驅逐", "中型", "輕型"];
 // 目標克制鏈：重>中>輕>驅逐>重（索引 0>2>3>1>0）
 const IDEAL_ADVANTAGE_PAIRS = [
@@ -328,6 +328,11 @@ function handleReportMatchResult(ws, data) {
     return;
   }
 
+  // 投降等已由房間結算寫入時，略過客戶端再報避免連勝被算兩次
+  if (room && room.leaderboardRecorded) {
+    return;
+  }
+
   const leaderboard = loadLeaderboard();
   const playerTank = normalizeTankIndex(
     data.tank_index != null ? data.tank_index : client.tankIndex
@@ -505,6 +510,7 @@ function handleTurnTimeout(room) {
       room.turns[i] = {
         move: [[pos[0], pos[1]]],
         shoot: [[pos[0], pos[1]]],
+        action: "play",
       };
       changed = true;
     }
@@ -537,6 +543,9 @@ function tryExecuteRound(room) {
     turns: room.turns.map((turn) => ({
       move: turn.move,
       shoot: turn.shoot,
+      action: turn.action || "play",
+      switch_slot:
+        Number.isInteger(Number(turn.switch_slot)) ? Number(turn.switch_slot) : -1,
     })),
   });
 
@@ -544,12 +553,37 @@ function tryExecuteRound(room) {
   startTurnBackupTimer(room, false);
 }
 
+function resetRematchVotes(room) {
+  room.rematchReady = [false, false];
+}
+
+function markRoomFinished(room) {
+  if (!room) return;
+  clearTurnTimer(room);
+  room.state = "finished";
+  room.turns = [{}, {}];
+  resetRematchVotes(room);
+}
+
 function tryStartGame(room) {
-  if (room.players.length < 2 || room.state !== "waiting") return;
+  if (room.players.length < 2) return;
+  if (room.state !== "waiting" && room.state !== "finished") return;
+  const isRematch = Boolean(room._rematchRestart);
+  clearTurnTimer(room);
   room.state = "playing";
   room.turns = [{}, {}];
   room.tankPositions = DEFAULT_TANK_POSITIONS.map((pos) => [...pos]);
   room.leaderboardRecorded = false;
+  room._rematchRestart = false;
+  resetRematchVotes(room);
+  // 同步房間內最新車種
+  for (const player of room.players) {
+    const client = clients.get(player.ws);
+    if (client) {
+      player.tankIndex = normalizeTankIndex(client.tankIndex);
+      player.displayName = normalizePlayerName(client.displayName);
+    }
+  }
   const firstAttacker = Math.floor(Math.random() * 2);
   const playerNames = getSortedPlayerNames(room);
   const tankIndices = getSortedTankIndices(room);
@@ -563,6 +597,7 @@ function tryStartGame(room) {
       player_names: playerNames,
       tank_indices: tankIndices,
       is_random: Boolean(room.isRandom),
+      rematch: isRematch,
     };
     if (room.isRandom) {
       payload.player_streaks = getPlayerStreaks(playerNames, "random");
@@ -570,6 +605,66 @@ function tryStartGame(room) {
     send(player.ws, payload);
   }
   startTurnBackupTimer(room, true);
+}
+
+function handleMatchFinished(ws) {
+  const client = clients.get(ws);
+  if (!client || !client.roomId) return;
+  const room = rooms.get(client.roomId);
+  if (!room) return;
+  if (room.state === "playing") {
+    markRoomFinished(room);
+  }
+}
+
+function handleRequestRematch(ws, data) {
+  const client = clients.get(ws);
+  if (!client || !client.roomId) {
+    sendError(ws, "尚未加入房間");
+    return;
+  }
+  const room = rooms.get(client.roomId);
+  if (!room) {
+    sendError(ws, "房間不存在");
+    return;
+  }
+  if (room.players.length < 2) {
+    sendError(ws, "對手已離開");
+    return;
+  }
+  if (room.state === "playing") {
+    markRoomFinished(room);
+  }
+  if (room.state !== "finished") {
+    sendError(ws, "目前無法再戰");
+    return;
+  }
+  if (data && data.tank_index != null) {
+    client.tankIndex = normalizeTankIndex(data.tank_index);
+    const me = room.players.find((p) => p.ws === ws);
+    if (me) me.tankIndex = client.tankIndex;
+  }
+  if (!Array.isArray(room.rematchReady) || room.rematchReady.length < 2) {
+    resetRematchVotes(room);
+  }
+  const index = client.playerIndex;
+  if (index !== 0 && index !== 1) {
+    sendError(ws, "玩家編號無效");
+    return;
+  }
+  room.rematchReady[index] = true;
+  const readyCount = room.rematchReady.filter(Boolean).length;
+  broadcastAll(room, {
+    type: "rematch_status",
+    ready: room.rematchReady.slice(),
+    ready_count: readyCount,
+    total: 2,
+    from_player_index: index,
+  });
+  if (readyCount >= 2) {
+    room._rematchRestart = true;
+    tryStartGame(room);
+  }
 }
 
 function tryMatchRandom() {
@@ -585,6 +680,7 @@ function tryMatchRandom() {
       turns: [{}, {}],
       players: [],
       isRandom: true,
+      rematchReady: [false, false],
     };
     rooms.set(roomId, room);
     joinPlayerToRoom(wsA, room, 0);
@@ -655,6 +751,7 @@ function handleCreateRoom(ws, data) {
     turns: [{}, {}],
     players: [],
     isRandom: false,
+    rematchReady: [false, false],
   };
   rooms.set(roomId, room);
   leaveRoom(ws);
@@ -739,6 +836,8 @@ function handleSurrender(ws) {
   room.state = "finished";
   const surrenderIndex = client.playerIndex;
   const winnerIndex = room.players.find((p) => p.playerIndex !== surrenderIndex)?.playerIndex ?? -1;
+  // 隨機房投降：伺服器直接記敗／記勝並中斷連勝
+  recordRandomRoomResult(room, winnerIndex, false);
   const payload = {
     type: "match_end",
     reason: "surrender",
@@ -779,7 +878,16 @@ function handleSubmitTurn(ws, data) {
     return;
   }
 
-  room.turns[index] = { move, shoot };
+  const action =
+    data.action === "switch" ? "switch" : "play";
+  const switchSlot = Number.isInteger(Number(data.switch_slot))
+    ? Number(data.switch_slot)
+    : -1;
+  const turnPayload = { move, shoot, action };
+  if (action === "switch" && switchSlot >= 0) {
+    turnPayload.switch_slot = switchSlot;
+  }
+  room.turns[index] = turnPayload;
 
   const submitted = room.turns.filter((turn) => turn.move && turn.shoot).length;
   broadcastAll(room, {
@@ -1154,6 +1262,12 @@ wss.on("connection", (ws) => {
         break;
       case "leave_match":
         leaveRoom(ws);
+        break;
+      case "match_finished":
+        handleMatchFinished(ws);
+        break;
+      case "request_rematch":
+        handleRequestRematch(ws, data);
         break;
       case "submit_turn":
         handleSubmitTurn(ws, data);
