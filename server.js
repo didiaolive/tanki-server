@@ -10,7 +10,7 @@ const {
 const lbStore = require("./leaderboard_store");
 
 const PORT = process.env.PORT || 8765;
-const SERVER_VERSION = "v47";
+const SERVER_VERSION = "v50";
 const TANK_ROLE_NAMES = ["重型", "驅逐", "中型", "輕型"];
 // 目標克制鏈：重>中>輕>驅逐>重（索引 0>2>3>1>0）
 const IDEAL_ADVANTAGE_PAIRS = [
@@ -24,8 +24,8 @@ const DEFAULT_TANK_POSITIONS = [[6, 9], [3, 0]];
 // 僅作卡死保險：須覆蓋開場拋硬幣／攻守交換動畫 + 客戶端 20s，不可比客戶端倒數更早觸發
 const TURN_BACKUP_FIRST_ROUND_MS = 70000;
 const TURN_BACKUP_ROUND_MS = 55000;
-// 結算後忽略上一回合遲到的 submit，避免連續 round_execute（攻守交換閃兩次）
-const SUBMIT_LOCK_AFTER_EXECUTE_MS = 12000;
+// 僅短暫擋「同一幀連送」的重複 submit；不可太長，否則下一回合合法提交會被吞掉而卡死
+const SUBMIT_LOCK_AFTER_EXECUTE_MS = 1500;
 
 /** @type {Map<string, any>} */
 const rooms = new Map();
@@ -503,12 +503,17 @@ function startTurnBackupTimer(room, isFirstRound) {
 }
 
 function handleClientTurnTimeout(ws) {
-  // 單方客戶端倒數不可強制結算對方（加速重設時限會不同步）；只重啟長備援
   const client = clients.get(ws);
   if (!client || !client.roomId) return;
   const room = rooms.get(client.roomId);
   if (!room || room.state !== "playing") return;
-  startTurnBackupTimer(room, false);
+  // 客戶端倒數已到 0：補齊未提交並結算（至少需已有一方提交，避免開局誤觸）
+  const submitted = room.turns.filter((turn) => turnHasPayload(turn)).length;
+  if (submitted <= 0) {
+    startTurnBackupTimer(room, false);
+    return;
+  }
+  handleTurnTimeout(room);
 }
 
 function turnHasPayload(turn) {
@@ -516,9 +521,14 @@ function turnHasPayload(turn) {
 }
 
 function handleTurnTimeout(room) {
-  room.turnTimer = null;
   if (!room || room.state !== "playing") return;
-  if (Date.now() < Number(room.submitLockUntil || 0)) return;
+  if (Date.now() < Number(room.submitLockUntil || 0)) {
+    // 鎖定期內備援觸發：稍後再試，不可直接放棄
+    clearTurnTimer(room);
+    room.turnTimer = setTimeout(() => handleTurnTimeout(room), 1000);
+    return;
+  }
+  room.turnTimer = null;
 
   let changed = false;
   for (let i = 0; i < 2; i++) {
@@ -880,8 +890,11 @@ function handleSubmitTurn(ws, data) {
     return;
   }
 
-  if (Date.now() < Number(room.submitLockUntil || 0)) {
-    // 上一回合結算動畫期間的遲到 submit，直接忽略
+  // 短鎖只擋連點重複；若本回合此玩家尚未有資料，仍接受（避免下一回合被 12 秒鎖卡死）
+  if (
+    Date.now() < Number(room.submitLockUntil || 0)
+    && turnHasPayload(room.turns[client.playerIndex])
+  ) {
     return;
   }
 
