@@ -10,7 +10,7 @@ const {
 const lbStore = require("./leaderboard_store");
 
 const PORT = process.env.PORT || 8765;
-const SERVER_VERSION = "v42";
+const SERVER_VERSION = "v44";
 const TANK_ROLE_NAMES = ["重型", "驅逐", "中型", "輕型"];
 // 目標克制鏈：重>中>輕>驅逐>重（索引 0>2>3>1>0）
 const IDEAL_ADVANTAGE_PAIRS = [
@@ -21,9 +21,11 @@ const IDEAL_ADVANTAGE_PAIRS = [
 ];
 
 const DEFAULT_TANK_POSITIONS = [[6, 9], [3, 0]];
-// 客戶端時限 20s；備援略寬鬆，自訂／隨機房皆啟用
-const TURN_BACKUP_FIRST_ROUND_MS = 22000;
-const TURN_BACKUP_ROUND_MS = 22000;
+// 僅作卡死保險：須覆蓋開場拋硬幣／攻守交換動畫 + 客戶端 20s，不可比客戶端倒數更早觸發
+const TURN_BACKUP_FIRST_ROUND_MS = 70000;
+const TURN_BACKUP_ROUND_MS = 55000;
+// 結算後忽略上一回合遲到的 submit，避免連續 round_execute（攻守交換閃兩次）
+const SUBMIT_LOCK_AFTER_EXECUTE_MS = 12000;
 
 /** @type {Map<string, any>} */
 const rooms = new Map();
@@ -501,22 +503,28 @@ function startTurnBackupTimer(room, isFirstRound) {
 }
 
 function handleClientTurnTimeout(ws) {
+  // 單方客戶端倒數不可強制結算對方（加速重設時限會不同步）；只重啟長備援
   const client = clients.get(ws);
   if (!client || !client.roomId) return;
   const room = rooms.get(client.roomId);
   if (!room || room.state !== "playing") return;
-  handleTurnTimeout(room);
+  startTurnBackupTimer(room, false);
+}
+
+function turnHasPayload(turn) {
+  return Boolean(turn && Array.isArray(turn.move) && Array.isArray(turn.shoot));
 }
 
 function handleTurnTimeout(room) {
   room.turnTimer = null;
   if (!room || room.state !== "playing") return;
+  if (Date.now() < Number(room.submitLockUntil || 0)) return;
 
   let changed = false;
   for (let i = 0; i < 2; i++) {
     const turn = room.turns[i] || {};
-    if (!turn.move || !turn.shoot) {
-      const pos = room.tankPositions[i];
+    if (!turnHasPayload(turn)) {
+      const pos = room.tankPositions[i] || DEFAULT_TANK_POSITIONS[i];
       room.turns[i] = {
         move: [[pos[0], pos[1]]],
         shoot: [[pos[0], pos[1]]],
@@ -528,7 +536,7 @@ function handleTurnTimeout(room) {
 
   if (!changed) return;
 
-  const submitted = room.turns.filter((turn) => turn.move && turn.shoot).length;
+  const submitted = room.turns.filter((turn) => turnHasPayload(turn)).length;
   broadcastAll(room, {
     type: "turn_status",
     submitted,
@@ -538,12 +546,12 @@ function handleTurnTimeout(room) {
 }
 
 function tryExecuteRound(room) {
-  const submitted = room.turns.filter((turn) => turn.move && turn.shoot).length;
+  const submitted = room.turns.filter((turn) => turnHasPayload(turn)).length;
   if (submitted < 2) return;
 
   for (let i = 0; i < 2; i++) {
-    const moveCells = normalizeTurnCells(room.turns[i].move);
-    if (moveCells) {
+    const moveCells = normalizeTurnCells(room.turns[i].move, true);
+    if (moveCells && moveCells.length > 0) {
       room.tankPositions[i] = [...finalMovePoint(moveCells)];
     }
   }
@@ -560,6 +568,7 @@ function tryExecuteRound(room) {
   });
 
   room.turns = [{}, {}];
+  room.submitLockUntil = Date.now() + SUBMIT_LOCK_AFTER_EXECUTE_MS;
   startTurnBackupTimer(room, false);
 }
 
@@ -843,24 +852,19 @@ function handleSurrender(ws) {
     return;
   }
 
+  clearTurnTimer(room);
   room.state = "finished";
   const surrenderIndex = client.playerIndex;
   const winnerIndex = room.players.find((p) => p.playerIndex !== surrenderIndex)?.playerIndex ?? -1;
   // 隨機房投降：伺服器直接記敗／記勝並中斷連勝
   recordRandomRoomResult(room, winnerIndex, false);
-  const payload = {
+  // 只發 match_end（勿再發 surrender，避免客戶端雙重結算把 UI 清掉）
+  broadcastAll(room, {
     type: "match_end",
     reason: "surrender",
     winner_index: winnerIndex,
     surrender_player_index: surrenderIndex,
-  };
-  for (const player of room.players) {
-    send(player.ws, payload);
-    send(player.ws, {
-      type: "surrender",
-      player_index: surrenderIndex,
-    });
-  }
+  });
 }
 
 function handleSubmitTurn(ws, data) {
@@ -876,6 +880,11 @@ function handleSubmitTurn(ws, data) {
     return;
   }
 
+  if (Date.now() < Number(room.submitLockUntil || 0)) {
+    // 上一回合結算動畫期間的遲到 submit，直接忽略
+    return;
+  }
+
   const move = normalizeTurnCells(data.move);
   // 允許空 shoot＝放棄攻擊（逾時／forfeit）
   const shoot = normalizeTurnCells(data.shoot, true);
@@ -885,7 +894,7 @@ function handleSubmitTurn(ws, data) {
   }
 
   const index = client.playerIndex;
-  if (room.turns[index].move && room.turns[index].shoot) {
+  if (turnHasPayload(room.turns[index])) {
     return;
   }
 
@@ -900,7 +909,7 @@ function handleSubmitTurn(ws, data) {
   }
   room.turns[index] = turnPayload;
 
-  const submitted = room.turns.filter((turn) => turn.move && turn.shoot).length;
+  const submitted = room.turns.filter((turn) => turnHasPayload(turn)).length;
   broadcastAll(room, {
     type: "turn_status",
     submitted,
@@ -996,7 +1005,7 @@ function handleSupplyArm(ws, data) {
   }
 
   const submitted = room.turns
-    ? room.turns.filter((turn) => turn && turn.move && turn.shoot).length
+    ? room.turns.filter((turn) => turnHasPayload(turn)).length
     : 0;
 
   broadcastAll(room, {
