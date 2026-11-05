@@ -10,7 +10,7 @@ const {
 const lbStore = require("./leaderboard_store");
 
 const PORT = process.env.PORT || 8765;
-const SERVER_VERSION = "v41";
+const SERVER_VERSION = "v42";
 const TANK_ROLE_NAMES = ["重型", "驅逐", "中型", "輕型"];
 // 目標克制鏈：重>中>輕>驅逐>重（索引 0>2>3>1>0）
 const IDEAL_ADVANTAGE_PAIRS = [
@@ -21,8 +21,9 @@ const IDEAL_ADVANTAGE_PAIRS = [
 ];
 
 const DEFAULT_TANK_POSITIONS = [[6, 9], [3, 0]];
-const TURN_BACKUP_FIRST_ROUND_MS = 50000;
-const TURN_BACKUP_ROUND_MS = 35000;
+// 客戶端時限 20s；備援略寬鬆，自訂／隨機房皆啟用
+const TURN_BACKUP_FIRST_ROUND_MS = 22000;
+const TURN_BACKUP_ROUND_MS = 22000;
 
 /** @type {Map<string, any>} */
 const rooms = new Map();
@@ -468,8 +469,9 @@ function getSortedTankIndices(room) {
     .map((player) => normalizeTankIndex(player.tankIndex));
 }
 
-function normalizeTurnCells(raw) {
-  if (!Array.isArray(raw) || raw.length === 0) return null;
+function normalizeTurnCells(raw, allowEmpty = false) {
+  if (!Array.isArray(raw)) return null;
+  if (raw.length === 0) return allowEmpty ? [] : null;
   if (typeof raw[0] === "number") {
     return [[Number(raw[0]), Number(raw[1])]];
   }
@@ -478,7 +480,7 @@ function normalizeTurnCells(raw) {
     if (!Array.isArray(point) || point.length < 2) return null;
     cells.push([Number(point[0]), Number(point[1])]);
   }
-  return cells.length > 0 ? cells : null;
+  return cells.length > 0 ? cells : allowEmpty ? [] : null;
 }
 
 function finalMovePoint(moveCells) {
@@ -493,9 +495,17 @@ function clearTurnTimer(room) {
 
 function startTurnBackupTimer(room, isFirstRound) {
   clearTurnTimer(room);
-  if (!room.isRandom || room.state !== "playing") return;
+  if (!room || room.state !== "playing") return;
   const delay = isFirstRound ? TURN_BACKUP_FIRST_ROUND_MS : TURN_BACKUP_ROUND_MS;
   room.turnTimer = setTimeout(() => handleTurnTimeout(room), delay);
+}
+
+function handleClientTurnTimeout(ws) {
+  const client = clients.get(ws);
+  if (!client || !client.roomId) return;
+  const room = rooms.get(client.roomId);
+  if (!room || room.state !== "playing") return;
+  handleTurnTimeout(room);
 }
 
 function handleTurnTimeout(room) {
@@ -867,8 +877,9 @@ function handleSubmitTurn(ws, data) {
   }
 
   const move = normalizeTurnCells(data.move);
-  const shoot = normalizeTurnCells(data.shoot);
-  if (!move || !shoot) {
+  // 允許空 shoot＝放棄攻擊（逾時／forfeit）
+  const shoot = normalizeTurnCells(data.shoot, true);
+  if (!move || shoot === null) {
     sendError(ws, "回合資料格式錯誤");
     return;
   }
@@ -1271,6 +1282,9 @@ wss.on("connection", (ws) => {
         break;
       case "submit_turn":
         handleSubmitTurn(ws, data);
+        break;
+      case "turn_timeout":
+        handleClientTurnTimeout(ws);
         break;
       case "treasure_spawn":
         handleTreasureSpawn(ws, data);
