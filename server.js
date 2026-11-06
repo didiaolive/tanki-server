@@ -4,13 +4,21 @@ const path = require("path");
 const { WebSocketServer } = require("ws");
 const {
   TANK_DISPLAY_NAMES,
+  PLAYER_RATE_MIN_GAMES,
+  PLAYER_AVG_MIN_GAMES,
+  TANK_AVG_MIN_APPEARANCES,
+  POPULARITY_WINDOW_MS,
   defaultMatchupMatrix,
+  defaultPlayerStats,
+  defaultTankStats,
   ensureMatchupMatrix,
+  ensurePlayerStats,
+  ensureTankStats,
 } = require("./leaderboard_schema");
 const lbStore = require("./leaderboard_store");
 
 const PORT = process.env.PORT || 8765;
-const SERVER_VERSION = "v52";
+const SERVER_VERSION = "v54";
 const TANK_ROLE_NAMES = ["重型", "驅逐", "中型", "輕型"];
 // 目標克制鏈：重>中>輕>驅逐>重（索引 0>2>3>1>0）
 const IDEAL_ADVANTAGE_PAIRS = [
@@ -80,27 +88,102 @@ function saveLeaderboard(data) {
   lbStore.saveLeaderboard(data);
 }
 
-// 僅在「正常戰鬥結束」時呼叫：同時更新連勝與車種勝敗（供戰力平衡參考）。
-// 投降、中離等非正常結束不應呼叫此函式。
-function recordModePlayerResult(bucket, playerName, tankIndex, won, isDraw) {
+function pruneAppearanceLog(log, now = Date.now()) {
+  const cutoff = now - POPULARITY_WINDOW_MS;
+  return (Array.isArray(log) ? log : [])
+    .map((t) => Number(t))
+    .filter((t) => Number.isFinite(t) && t >= cutoff);
+}
+
+function normalizeCombatPayload(raw) {
+  const kills = Math.max(0, Math.min(3, Number(raw?.kills || 0) || 0));
+  const treasures = Math.max(0, Math.min(3, Number(raw?.treasures || 0) || 0));
+  const appeared = [];
+  const seen = new Set();
+  const rawAppeared = Array.isArray(raw?.appeared_tanks) ? raw.appeared_tanks : [];
+  for (const entry of rawAppeared) {
+    const idx = normalizeTankIndex(entry);
+    if (seen.has(idx)) continue;
+    seen.add(idx);
+    appeared.push(idx);
+  }
+  const tankKills = [0, 0, 0, 0];
+  const tankTreasures = [0, 0, 0, 0];
+  const rawKills = raw?.tank_kills && typeof raw.tank_kills === "object" ? raw.tank_kills : {};
+  const rawTreasures =
+    raw?.tank_treasures && typeof raw.tank_treasures === "object" ? raw.tank_treasures : {};
+  for (let i = 0; i < 4; i++) {
+    tankKills[i] = Math.max(0, Math.min(3, Number(rawKills[i] || rawKills[String(i)] || 0) || 0));
+    tankTreasures[i] = Math.max(
+      0,
+      Math.min(3, Number(rawTreasures[i] || rawTreasures[String(i)] || 0) || 0)
+    );
+  }
+  if (appeared.length === 0 && raw?.tank_index != null) {
+    appeared.push(normalizeTankIndex(raw.tank_index));
+  }
+  return { kills, treasures, appeared, tankKills, tankTreasures };
+}
+
+function applyCombatStats(bucket, playerName, combat, now = Date.now()) {
+  if (!combat) return;
   const name = normalizePlayerName(playerName);
   if (!bucket.players[name]) {
-    bucket.players[name] = { bestStreak: 0, currentStreak: 0 };
+    bucket.players[name] = defaultPlayerStats();
+  } else {
+    bucket.players[name] = ensurePlayerStats(bucket.players[name]);
   }
   const player = bucket.players[name];
+  player.kills += combat.kills;
+  player.treasures += combat.treasures;
+
+  if (!Array.isArray(bucket.tanks) || bucket.tanks.length !== 4) {
+    bucket.tanks = TANK_DISPLAY_NAMES.map(() => defaultTankStats());
+  }
+  for (const tankIndex of combat.appeared) {
+    const tank = ensureTankStats(bucket.tanks[tankIndex]);
+    tank.appearances += 1;
+    tank.appearanceLog = pruneAppearanceLog(tank.appearanceLog, now);
+    tank.appearanceLog.push(now);
+    tank.kills += Number(combat.tankKills[tankIndex] || 0);
+    tank.treasures += Number(combat.tankTreasures[tankIndex] || 0);
+    bucket.tanks[tankIndex] = tank;
+  }
+}
+
+/** 結算一場（含投降／中離）：更新連勝、勝敗、場次與結算車種勝敗。 */
+function recordModePlayerResult(bucket, playerName, tankIndex, won, isDraw, combat = null) {
+  const name = normalizePlayerName(playerName);
+  if (!bucket.players[name]) {
+    bucket.players[name] = defaultPlayerStats();
+  } else {
+    bucket.players[name] = ensurePlayerStats(bucket.players[name]);
+  }
+  const player = bucket.players[name];
+  player.matches += 1;
   if (isDraw) {
     player.currentStreak = 0;
   } else if (won) {
     player.currentStreak += 1;
     player.bestStreak = Math.max(player.bestStreak, player.currentStreak);
+    player.wins += 1;
   } else {
     player.currentStreak = 0;
+    player.losses += 1;
   }
 
-  const tank = bucket.tanks[normalizeTankIndex(tankIndex)];
+  if (!Array.isArray(bucket.tanks) || bucket.tanks.length !== 4) {
+    bucket.tanks = TANK_DISPLAY_NAMES.map(() => defaultTankStats());
+  }
+  const tank = ensureTankStats(bucket.tanks[normalizeTankIndex(tankIndex)]);
   if (!isDraw) {
     if (won) tank.wins += 1;
     else tank.losses += 1;
+  }
+  bucket.tanks[normalizeTankIndex(tankIndex)] = tank;
+
+  if (combat) {
+    applyCombatStats(bucket, name, combat);
   }
 }
 
@@ -123,12 +206,12 @@ function recordTankMatchup(bucket, tankA, tankB, aWon, isDraw) {
   }
 }
 
-function recordRandomPlayerResult(leaderboard, playerName, tankIndex, won, isDraw) {
-  recordModePlayerResult(leaderboard.random, playerName, tankIndex, won, isDraw);
+function recordRandomPlayerResult(leaderboard, playerName, tankIndex, won, isDraw, combat = null) {
+  recordModePlayerResult(leaderboard.random, playerName, tankIndex, won, isDraw, combat);
 }
 
-function recordAiPlayerResult(leaderboard, playerName, tankIndex, won, isDraw) {
-  recordModePlayerResult(leaderboard.ai, playerName, tankIndex, won, isDraw);
+function recordAiPlayerResult(leaderboard, playerName, tankIndex, won, isDraw, combat = null) {
+  recordModePlayerResult(leaderboard.ai, playerName, tankIndex, won, isDraw, combat);
 }
 
 function pruneDeadClients() {
@@ -217,20 +300,107 @@ function recordRandomRoomResult(room, winnerIndex, isDraw = false) {
   saveLeaderboard(leaderboard);
 }
 
+function playerMatches(stats) {
+  const explicit = Number(stats.matches || 0);
+  if (explicit > 0) return explicit;
+  return Number(stats.wins || 0) + Number(stats.losses || 0);
+}
+
 function getTop10Streak(players) {
   return Object.entries(players)
     .map(([name, stats]) => ({
       name,
       value: Number(stats.bestStreak || 0),
-      wins: 0,
-      losses: 0,
+      wins: Number(stats.wins || 0),
+      losses: Number(stats.losses || 0),
+      matches: playerMatches(stats),
     }))
-    .sort((a, b) => b.value - a.value || a.name.localeCompare(b.name))
+    .filter((entry) => entry.value > 0)
+    .sort(
+      (a, b) =>
+        b.value - a.value || b.wins - a.wins || a.name.localeCompare(b.name)
+    )
     .slice(0, 10);
 }
 
 function getTop3Streak(players) {
   return getTop10Streak(players).slice(0, 3);
+}
+
+function getTop10PlayerWins(players) {
+  return Object.entries(players)
+    .map(([name, stats]) => {
+      const wins = Number(stats.wins || 0);
+      const losses = Number(stats.losses || 0);
+      const total = wins + losses;
+      return {
+        name,
+        value: wins,
+        wins,
+        losses,
+        matches: playerMatches(stats),
+        rate: total > 0 ? (wins * 100) / total : 0,
+      };
+    })
+    .filter((entry) => entry.wins > 0)
+    .sort(
+      (a, b) =>
+        b.value - a.value ||
+        b.matches - a.matches ||
+        a.name.localeCompare(b.name)
+    )
+    .slice(0, 10);
+}
+
+function getTop10PlayerWinrate(players) {
+  return Object.entries(players)
+    .map(([name, stats]) => {
+      const wins = Number(stats.wins || 0);
+      const losses = Number(stats.losses || 0);
+      const total = wins + losses;
+      const rate = total > 0 ? wins / total : 0;
+      return {
+        name,
+        value: total > 0 ? Math.round(rate * 100) : 0,
+        wins,
+        losses,
+        matches: playerMatches(stats),
+        rate,
+      };
+    })
+    .filter((entry) => entry.wins + entry.losses >= PLAYER_RATE_MIN_GAMES)
+    .sort(
+      (a, b) =>
+        b.rate - a.rate ||
+        b.matches - a.matches ||
+        a.name.localeCompare(b.name)
+    )
+    .slice(0, 10);
+}
+
+function getTop10PlayerAvg(players, field) {
+  return Object.entries(players)
+    .map(([name, stats]) => {
+      const matches = playerMatches(stats);
+      const total = Number(stats[field] || 0);
+      const avg = matches > 0 ? total / matches : 0;
+      return {
+        name,
+        value: Math.round(avg * 100) / 100,
+        wins: Number(stats.wins || 0),
+        losses: Number(stats.losses || 0),
+        matches,
+        total,
+      };
+    })
+    .filter((entry) => entry.matches >= PLAYER_AVG_MIN_GAMES)
+    .sort(
+      (a, b) =>
+        b.value - a.value ||
+        b.matches - a.matches ||
+        a.name.localeCompare(b.name)
+    )
+    .slice(0, 10);
 }
 
 function getAllTankWinrate(tanks) {
@@ -262,10 +432,61 @@ function getTop3TankWinrate(tanks) {
     .slice(0, 3);
 }
 
+function getAllTankPopularity(tanks, now = Date.now()) {
+  return tanks
+    .map((raw, index) => {
+      const tank = ensureTankStats(raw);
+      const log = pruneAppearanceLog(tank.appearanceLog, now);
+      return {
+        name: TANK_DISPLAY_NAMES[index] || `戰車${index + 1}`,
+        value: log.length,
+        wins: Number(tank.wins || 0),
+        losses: Number(tank.losses || 0),
+        matches: log.length,
+        appearances: Number(tank.appearances || 0),
+      };
+    })
+    .sort(
+      (a, b) =>
+        b.value - a.value ||
+        b.appearances - a.appearances ||
+        a.name.localeCompare(b.name)
+    );
+}
+
+function getAllTankAvg(tanks, field) {
+  return tanks
+    .map((raw, index) => {
+      const tank = ensureTankStats(raw);
+      const appearances = Number(tank.appearances || 0);
+      const total = Number(tank[field] || 0);
+      const qualified = appearances >= TANK_AVG_MIN_APPEARANCES;
+      const avg = appearances > 0 ? total / appearances : 0;
+      return {
+        name: TANK_DISPLAY_NAMES[index] || `戰車${index + 1}`,
+        value: qualified ? Math.round(avg * 100) / 100 : 0,
+        wins: Number(tank.wins || 0),
+        losses: Number(tank.losses || 0),
+        matches: appearances,
+        total,
+        appearances,
+        qualified,
+      };
+    })
+    .sort((a, b) => {
+      if (a.qualified !== b.qualified) return a.qualified ? -1 : 1;
+      return (
+        b.value - a.value ||
+        b.appearances - a.appearances ||
+        a.name.localeCompare(b.name)
+      );
+    });
+}
+
 function padTopN(entries, count) {
   const result = entries.slice(0, count);
   while (result.length < count) {
-    result.push({ name: "---", value: 0, wins: 0, losses: 0 });
+    result.push({ name: "---", value: 0, wins: 0, losses: 0, matches: 0 });
   }
   return result;
 }
@@ -288,12 +509,27 @@ function padTop3(entries) {
 
 function buildLeaderboardPayload() {
   const leaderboard = loadLeaderboard();
+  const now = Date.now();
   return {
     type: "leaderboard",
     random_streak_top3: padTop3(getTop3Streak(leaderboard.random.players)),
     random_streak_top10: padTopN(getTop10Streak(leaderboard.random.players), 10),
+    random_winrate_top3: padTop3(getTop10PlayerWinrate(leaderboard.random.players)),
+    random_winrate_top10: padTopN(getTop10PlayerWinrate(leaderboard.random.players), 10),
+    random_wins_top3: padTop3(getTop10PlayerWins(leaderboard.random.players)),
+    random_wins_top10: padTopN(getTop10PlayerWins(leaderboard.random.players), 10),
+    random_kills_top3: padTop3(getTop10PlayerAvg(leaderboard.random.players, "kills")),
+    random_kills_top10: padTopN(getTop10PlayerAvg(leaderboard.random.players, "kills"), 10),
+    random_treasures_top3: padTop3(getTop10PlayerAvg(leaderboard.random.players, "treasures")),
+    random_treasures_top10: padTopN(
+      getTop10PlayerAvg(leaderboard.random.players, "treasures"),
+      10
+    ),
     random_tank_top3: padTop3(getTop3TankWinrate(leaderboard.random.tanks)),
     random_tank_all: getAllTankWinrate(leaderboard.random.tanks),
+    random_tank_popularity_all: getAllTankPopularity(leaderboard.random.tanks, now),
+    random_tank_kills_all: getAllTankAvg(leaderboard.random.tanks, "kills"),
+    random_tank_treasures_all: getAllTankAvg(leaderboard.random.tanks, "treasures"),
     ai_streak_top3: padTop3(getTop3Streak(leaderboard.ai.players)),
     ai_streak_top10: padTopN(getTop10Streak(leaderboard.ai.players), 10),
     ai_tank_top3: padTop3(getTop3TankWinrate(leaderboard.ai.tanks)),
@@ -305,6 +541,15 @@ function handleGetLeaderboard(ws) {
   send(ws, buildLeaderboardPayload());
 }
 
+function markRoomCombatRecorded(room, playerName) {
+  if (!room) return false;
+  if (!room.combatRecorded) room.combatRecorded = new Set();
+  const name = normalizePlayerName(playerName);
+  if (room.combatRecorded.has(name)) return false;
+  room.combatRecorded.add(name);
+  return true;
+}
+
 function handleReportMatchResult(ws, data) {
   const client = clients.get(ws);
   if (!client) return;
@@ -313,18 +558,20 @@ function handleReportMatchResult(ws, data) {
   const mode = String(data.mode || "random");
   const isDraw = Boolean(data.is_draw);
   const winnerIndex = Number(data.winner_index);
+  const combat = normalizeCombatPayload(data);
+  const playerTank = normalizeTankIndex(
+    data.tank_index != null ? data.tank_index : client.tankIndex
+  );
 
   if (mode === "ai") {
     const leaderboard = loadLeaderboard();
-    const playerTank = normalizeTankIndex(
-      data.tank_index != null ? data.tank_index : client.tankIndex
-    );
     recordAiPlayerResult(
       leaderboard,
       client.displayName,
       playerTank,
       Boolean(data.won),
-      isDraw
+      isDraw,
+      combat
     );
     if (data.opponent_tank_index != null) {
       recordTankMatchup(
@@ -343,25 +590,31 @@ function handleReportMatchResult(ws, data) {
 
   if (room && room.isRandom && room.state === "playing" && Number.isInteger(winnerIndex)) {
     recordRandomRoomResult(room, winnerIndex, isDraw);
-    return;
   }
 
-  // 投降等已由房間結算寫入時，略過客戶端再報避免連勝被算兩次
+  // 投降／中離等已由房間結算寫入勝敗時，仍可補擊殺／奪寶／出場
   if (room && room.leaderboardRecorded) {
+    if (markRoomCombatRecorded(room, client.displayName)) {
+      const leaderboard = loadLeaderboard();
+      applyCombatStats(leaderboard.random, client.displayName, combat);
+      saveLeaderboard(leaderboard);
+    }
     return;
   }
 
   const leaderboard = loadLeaderboard();
-  const playerTank = normalizeTankIndex(
-    data.tank_index != null ? data.tank_index : client.tankIndex
-  );
   recordRandomPlayerResult(
     leaderboard,
     client.displayName,
     playerTank,
     Boolean(data.won),
-    isDraw
+    isDraw,
+    combat
   );
+  if (room) {
+    room.leaderboardRecorded = true;
+    markRoomCombatRecorded(room, client.displayName);
+  }
   if (data.opponent_tank_index != null) {
     recordTankMatchup(
       leaderboard.random,
@@ -435,6 +688,9 @@ function leaveRoom(ws) {
   if ((wasPlaying || wasFinished) && room.players.length === 1) {
     const winner = room.players[0];
     room.state = "finished";
+    if (wasPlaying && room.isRandom) {
+      recordRandomRoomResult(room, winner.playerIndex, false);
+    }
     send(winner.ws, {
       type: "match_end",
       reason: "opponent_left",
