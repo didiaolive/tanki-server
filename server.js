@@ -1019,6 +1019,9 @@ function resolveQueueHiddenE(client, fallback) {
 function currentMatchBand(client, now = Date.now()) {
   const waited = now - Number(client.queuedAt || now);
   const t1Ms = Math.max(1000, Number(client.queueT1Ms || 5000));
+  const t2Ms = Math.max(t1Ms + 1000, Number(client.queueT2Ms || 10000));
+  // 接近／超過 T2 仍優先撮合真人，避免雙方同時被客戶端切偽 AI
+  if (waited >= t2Ms - 500) return 99999;
   return waited >= t1Ms ? MATCH_BAND_WIDE : MATCH_BAND_NARROW;
 }
 
