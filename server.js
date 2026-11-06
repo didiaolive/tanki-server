@@ -8,6 +8,10 @@ const {
   PLAYER_AVG_MIN_GAMES,
   TANK_AVG_MIN_APPEARANCES,
   POPULARITY_WINDOW_MS,
+  HIDDEN_E_DEFAULT,
+  HIDDEN_E_MIN,
+  HIDDEN_E_MAX,
+  HIDDEN_E_DELTA,
   defaultMatchupMatrix,
   defaultPlayerStats,
   defaultTankStats,
@@ -18,7 +22,9 @@ const {
 const lbStore = require("./leaderboard_store");
 
 const PORT = process.env.PORT || 8765;
-const SERVER_VERSION = "v54";
+const SERVER_VERSION = "v55";
+const MATCH_BAND_NARROW = 100;
+const MATCH_BAND_WIDE = 250;
 const TANK_ROLE_NAMES = ["重型", "驅逐", "中型", "輕型"];
 // 目標克制鏈：重>中>輕>驅逐>重（索引 0>2>3>1>0）
 const IDEAL_ADVANTAGE_PAIRS = [
@@ -167,9 +173,17 @@ function recordModePlayerResult(bucket, playerName, tankIndex, won, isDraw, comb
     player.currentStreak += 1;
     player.bestStreak = Math.max(player.bestStreak, player.currentStreak);
     player.wins += 1;
+    player.hiddenE = Math.min(
+      HIDDEN_E_MAX,
+      Number(player.hiddenE || HIDDEN_E_DEFAULT) + HIDDEN_E_DELTA
+    );
   } else {
     player.currentStreak = 0;
     player.losses += 1;
+    player.hiddenE = Math.max(
+      HIDDEN_E_MIN,
+      Number(player.hiddenE || HIDDEN_E_DEFAULT) - HIDDEN_E_DELTA
+    );
   }
 
   if (!Array.isArray(bucket.tanks) || bucket.tanks.length !== 4) {
@@ -986,25 +1000,79 @@ function handleRequestRematch(ws, data) {
   }
 }
 
+function clampHiddenE(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return HIDDEN_E_DEFAULT;
+  return Math.max(HIDDEN_E_MIN, Math.min(HIDDEN_E_MAX, Math.round(n)));
+}
+
+function resolveQueueHiddenE(client, fallback) {
+  const leaderboard = loadLeaderboard();
+  const name = normalizePlayerName(client.displayName);
+  const stored = leaderboard.random?.players?.[name];
+  if (stored && stored.hiddenE != null) {
+    return clampHiddenE(stored.hiddenE);
+  }
+  return clampHiddenE(fallback);
+}
+
+function currentMatchBand(client, now = Date.now()) {
+  const waited = now - Number(client.queuedAt || now);
+  const t1Ms = Math.max(1000, Number(client.queueT1Ms || 5000));
+  return waited >= t1Ms ? MATCH_BAND_WIDE : MATCH_BAND_NARROW;
+}
+
+function startRandomRoom(wsA, wsB) {
+  const roomId = makeRoomId();
+  const room = {
+    id: roomId,
+    name: `隨機對戰 ${roomId}`,
+    password: "",
+    state: "waiting",
+    turns: [{}, {}],
+    players: [],
+    isRandom: true,
+    rematchReady: [false, false],
+  };
+  rooms.set(roomId, room);
+  joinPlayerToRoom(wsA, room, 0);
+  joinPlayerToRoom(wsB, room, 1);
+  tryStartGame(room);
+}
+
 function tryMatchRandom() {
-  while (matchQueue.length >= 2) {
-    const wsA = matchQueue.shift();
-    const wsB = matchQueue.shift();
-    const roomId = makeRoomId();
-    const room = {
-      id: roomId,
-      name: `隨機對戰 ${roomId}`,
-      password: "",
-      state: "waiting",
-      turns: [{}, {}],
-      players: [],
-      isRandom: true,
-      rematchReady: [false, false],
-    };
-    rooms.set(roomId, room);
-    joinPlayerToRoom(wsA, room, 0);
-    joinPlayerToRoom(wsB, room, 1);
-    tryStartGame(room);
+  pruneDeadClients();
+  const now = Date.now();
+  // 清掉已斷線或已進房的佇列項
+  for (let i = matchQueue.length - 1; i >= 0; i--) {
+    const ws = matchQueue[i];
+    const client = clients.get(ws);
+    if (!client || ws.readyState !== ws.OPEN || client.roomId) {
+      matchQueue.splice(i, 1);
+    }
+  }
+  let matched = true;
+  while (matched && matchQueue.length >= 2) {
+    matched = false;
+    outer: for (let i = 0; i < matchQueue.length; i++) {
+      for (let j = i + 1; j < matchQueue.length; j++) {
+        const wsA = matchQueue[i];
+        const wsB = matchQueue[j];
+        const a = clients.get(wsA);
+        const b = clients.get(wsB);
+        if (!a || !b) continue;
+        const dE = Math.abs(
+          clampHiddenE(a.hiddenE) - clampHiddenE(b.hiddenE)
+        );
+        const allowed = Math.min(currentMatchBand(a, now), currentMatchBand(b, now));
+        if (dE > allowed) continue;
+        matchQueue.splice(j, 1);
+        matchQueue.splice(i, 1);
+        startRandomRoom(wsA, wsB);
+        matched = true;
+        break outer;
+      }
+    }
   }
 }
 
@@ -1114,10 +1182,21 @@ function handleJoinRandom(ws, data) {
   if (!applyPlayerLoadout(ws, data)) return;
   removeFromQueue(ws);
   leaveRoom(ws);
+  const client = clients.get(ws);
+  if (!client) return;
+  client.hiddenE = resolveQueueHiddenE(client, data.hidden_e);
+  client.queueT1Ms = Math.max(1000, Math.round(Number(data.t1_sec || 5) * 1000));
+  client.queueT2Ms = Math.max(client.queueT1Ms + 1000, Math.round(Number(data.t2_sec || 10) * 1000));
+  client.queuedAt = Date.now();
   if (!matchQueue.includes(ws)) {
     matchQueue.push(ws);
   }
-  send(ws, { type: "match_queued" });
+  send(ws, {
+    type: "match_queued",
+    hidden_e: client.hiddenE,
+    t1_sec: client.queueT1Ms / 1000,
+    t2_sec: client.queueT2Ms / 1000,
+  });
   tryMatchRandom();
 }
 
@@ -1654,6 +1733,14 @@ if (require.main === module) {
       }
       server.listen(PORT, () => {
         console.log(`Tanki server listening on port ${PORT}`);
+        // 擴大搜尋後需週期重試配對（不能只在 join 時配）
+        setInterval(() => {
+          try {
+            tryMatchRandom();
+          } catch (err) {
+            console.warn("[Matchmaking] tryMatchRandom error:", err);
+          }
+        }, 500);
       });
     })
     .catch((err) => {

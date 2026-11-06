@@ -11,6 +11,11 @@ function defaultMatchupMatrix() {
   );
 }
 
+const HIDDEN_E_DEFAULT = 1000;
+const HIDDEN_E_MIN = 200;
+const HIDDEN_E_MAX = 2000;
+const HIDDEN_E_DELTA = 20;
+
 function defaultPlayerStats() {
   return {
     bestStreak: 0,
@@ -20,6 +25,7 @@ function defaultPlayerStats() {
     matches: 0,
     kills: 0,
     treasures: 0,
+    hiddenE: HIDDEN_E_DEFAULT,
   };
 }
 
@@ -71,6 +77,9 @@ function ensureMatchupMatrix(raw) {
 function ensurePlayerStats(raw) {
   const base = defaultPlayerStats();
   if (!raw || typeof raw !== "object") return base;
+  let hiddenE = Number(raw.hiddenE);
+  if (!Number.isFinite(hiddenE)) hiddenE = HIDDEN_E_DEFAULT;
+  hiddenE = Math.max(HIDDEN_E_MIN, Math.min(HIDDEN_E_MAX, hiddenE));
   return {
     bestStreak: Number(raw.bestStreak || 0),
     currentStreak: Number(raw.currentStreak || 0),
@@ -79,6 +88,7 @@ function ensurePlayerStats(raw) {
     matches: Number(raw.matches || 0),
     kills: Number(raw.kills || 0),
     treasures: Number(raw.treasures || 0),
+    hiddenE,
   };
 }
 
@@ -158,6 +168,10 @@ module.exports = {
   PLAYER_AVG_MIN_GAMES,
   TANK_AVG_MIN_APPEARANCES,
   POPULARITY_WINDOW_MS,
+  HIDDEN_E_DEFAULT,
+  HIDDEN_E_MIN,
+  HIDDEN_E_MAX,
+  HIDDEN_E_DELTA,
   defaultLeaderboard,
   defaultPlayerStats,
   defaultTankStats,
