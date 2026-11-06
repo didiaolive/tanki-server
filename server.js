@@ -10,7 +10,7 @@ const {
 const lbStore = require("./leaderboard_store");
 
 const PORT = process.env.PORT || 8765;
-const SERVER_VERSION = "v50";
+const SERVER_VERSION = "v52";
 const TANK_ROLE_NAMES = ["重型", "驅逐", "中型", "輕型"];
 // 目標克制鏈：重>中>輕>驅逐>重（索引 0>2>3>1>0）
 const IDEAL_ADVANTAGE_PAIRS = [
@@ -55,6 +55,21 @@ function normalizeTankIndex(raw) {
   const index = Number(raw);
   if (!Number.isInteger(index) || index < 0 || index > 3) return 0;
   return index;
+}
+
+/** 正規化 3 車編隊；缺漏以先頭車補齊 */
+function normalizeTankRoster(raw, fallbackIndex = 0) {
+  const fallback = normalizeTankIndex(fallbackIndex);
+  const out = [];
+  if (Array.isArray(raw)) {
+    for (const entry of raw) {
+      out.push(normalizeTankIndex(entry));
+      if (out.length >= 3) break;
+    }
+  }
+  if (out.length === 0) out.push(fallback);
+  while (out.length < 3) out.push(out[0]);
+  return out.slice(0, 3);
 }
 
 function loadLeaderboard() {
@@ -369,8 +384,11 @@ function applyPlayerLoadout(ws, data) {
       return false;
     }
   }
-  if (data.tank_index != null) {
-    client.tankIndex = normalizeTankIndex(data.tank_index);
+  if (data.tank_roster != null || data.tank_index != null) {
+    const leadFallback =
+      data.tank_index != null ? normalizeTankIndex(data.tank_index) : client.tankIndex;
+    client.tankRoster = normalizeTankRoster(data.tank_roster, leadFallback);
+    client.tankIndex = client.tankRoster[0];
   }
   return true;
 }
@@ -469,6 +487,13 @@ function getSortedTankIndices(room) {
     .slice()
     .sort((a, b) => a.playerIndex - b.playerIndex)
     .map((player) => normalizeTankIndex(player.tankIndex));
+}
+
+function getSortedTankRosters(room) {
+  return room.players
+    .slice()
+    .sort((a, b) => a.playerIndex - b.playerIndex)
+    .map((player) => normalizeTankRoster(player.tankRoster, player.tankIndex));
 }
 
 function normalizeTurnCells(raw, allowEmpty = false) {
@@ -605,17 +630,19 @@ function tryStartGame(room) {
   room.leaderboardRecorded = false;
   room._rematchRestart = false;
   resetRematchVotes(room);
-  // 同步房間內最新車種
+  // 同步房間內最新車種／編隊
   for (const player of room.players) {
     const client = clients.get(player.ws);
     if (client) {
-      player.tankIndex = normalizeTankIndex(client.tankIndex);
+      player.tankRoster = normalizeTankRoster(client.tankRoster, client.tankIndex);
+      player.tankIndex = player.tankRoster[0];
       player.displayName = normalizePlayerName(client.displayName);
     }
   }
   const firstAttacker = Math.floor(Math.random() * 2);
   const playerNames = getSortedPlayerNames(room);
   const tankIndices = getSortedTankIndices(room);
+  const tankRosters = getSortedTankRosters(room);
   for (const player of room.players) {
     const payload = {
       type: "game_start",
@@ -625,6 +652,7 @@ function tryStartGame(room) {
       first_attacker: firstAttacker,
       player_names: playerNames,
       tank_indices: tankIndices,
+      tank_rosters: tankRosters,
       is_random: Boolean(room.isRandom),
       rematch: isRematch,
     };
@@ -668,10 +696,16 @@ function handleRequestRematch(ws, data) {
     sendError(ws, "目前無法再戰");
     return;
   }
-  if (data && data.tank_index != null) {
-    client.tankIndex = normalizeTankIndex(data.tank_index);
+  if (data && (data.tank_roster != null || data.tank_index != null)) {
+    const leadFallback =
+      data.tank_index != null ? normalizeTankIndex(data.tank_index) : client.tankIndex;
+    client.tankRoster = normalizeTankRoster(data.tank_roster, leadFallback);
+    client.tankIndex = client.tankRoster[0];
     const me = room.players.find((p) => p.ws === ws);
-    if (me) me.tankIndex = client.tankIndex;
+    if (me) {
+      me.tankRoster = client.tankRoster.slice();
+      me.tankIndex = client.tankIndex;
+    }
   }
   if (!Array.isArray(room.rematchReady) || room.rematchReady.length < 2) {
     resetRematchVotes(room);
@@ -729,8 +763,11 @@ function joinPlayerToRoom(ws, room, playerIndex) {
   }
 
   const displayName = normalizePlayerName(client.displayName);
-  const tankIndex = normalizeTankIndex(client.tankIndex);
-  room.players.push({ ws, playerIndex, displayName, tankIndex });
+  const tankRoster = normalizeTankRoster(client.tankRoster, client.tankIndex);
+  const tankIndex = tankRoster[0];
+  client.tankRoster = tankRoster;
+  client.tankIndex = tankIndex;
+  room.players.push({ ws, playerIndex, displayName, tankIndex, tankRoster });
   client.roomId = room.id;
   client.playerIndex = playerIndex;
 
@@ -840,7 +877,8 @@ function handleAnnouncePlayerName(ws, data) {
   const player = room.players.find((entry) => entry.ws === ws);
   if (player) {
     player.displayName = normalizePlayerName(client.displayName);
-    player.tankIndex = normalizeTankIndex(client.tankIndex);
+    player.tankRoster = normalizeTankRoster(client.tankRoster, client.tankIndex);
+    player.tankIndex = player.tankRoster[0];
   }
 
   broadcastAll(room, {
@@ -1261,6 +1299,7 @@ wss.on("connection", (ws) => {
     playerIndex: -1,
     displayName: "玩家",
     tankIndex: 0,
+    tankRoster: [0, 0, 0],
     ownerToken: null,
   });
 
