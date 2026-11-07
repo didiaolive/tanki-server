@@ -82,7 +82,16 @@ function defaultTankStats() {
   };
 }
 
-function defaultLeaderboard() {
+/** app＝正式榜（Google Play 等）；web＝試玩榜（互不合併） */
+function normalizeLeaderboardPlatform(raw) {
+  const p = String(raw || "")
+    .trim()
+    .toLowerCase();
+  if (p === "web" || p === "html5" || p === "html") return "web";
+  return "app";
+}
+
+function defaultPlatformBoard() {
   return {
     random: {
       players: {},
@@ -95,6 +104,24 @@ function defaultLeaderboard() {
       matchups: defaultMatchupMatrix(),
     },
   };
+}
+
+function defaultLeaderboard() {
+  return {
+    app: defaultPlatformBoard(),
+    web: defaultPlatformBoard(),
+  };
+}
+
+function isLegacyFlatLeaderboard(raw) {
+  return Boolean(
+    raw &&
+      typeof raw === "object" &&
+      raw.random &&
+      raw.ai &&
+      !raw.app &&
+      !raw.web
+  );
 }
 
 function ensureMatchupMatrix(raw) {
@@ -151,48 +178,74 @@ function ensureTankStats(raw) {
   };
 }
 
+function ensurePlatformBoard(board) {
+  const out = board && typeof board === "object" ? board : {};
+  if (!out.random) {
+    out.random = defaultPlatformBoard().random;
+  }
+  if (!out.random.players) out.random.players = {};
+  for (const key of Object.keys(out.random.players)) {
+    const stats = ensurePlayerStats(out.random.players[key]);
+    if (!stats.displayName) {
+      stats.displayName = isPlayerUid(key) ? "" : String(key);
+    }
+    out.random.players[key] = stats;
+  }
+  if (!Array.isArray(out.random.tanks) || out.random.tanks.length !== 4) {
+    out.random.tanks = TANK_DISPLAY_NAMES.map(() => defaultTankStats());
+  } else {
+    out.random.tanks = out.random.tanks.map((t) => ensureTankStats(t));
+  }
+  out.random.matchups = ensureMatchupMatrix(out.random.matchups);
+  if (!out.ai) {
+    out.ai = defaultPlatformBoard().ai;
+  }
+  if (!out.ai.players) out.ai.players = {};
+  for (const key of Object.keys(out.ai.players)) {
+    const stats = ensurePlayerStats(out.ai.players[key]);
+    if (!stats.displayName) {
+      stats.displayName = isPlayerUid(key) ? "" : String(key);
+    }
+    out.ai.players[key] = stats;
+  }
+  if (!Array.isArray(out.ai.tanks) || out.ai.tanks.length !== 4) {
+    out.ai.tanks = TANK_DISPLAY_NAMES.map(() => defaultTankStats());
+  } else {
+    out.ai.tanks = out.ai.tanks.map((t) => ensureTankStats(t));
+  }
+  out.ai.matchups = ensureMatchupMatrix(out.ai.matchups);
+  return out;
+}
+
 function ensureLeaderboardShape(leaderboard) {
-  if (!leaderboard.random) {
-    leaderboard.random = defaultLeaderboard().random;
+  if (!leaderboard || typeof leaderboard !== "object") {
+    return defaultLeaderboard();
   }
-  if (!leaderboard.random.players) leaderboard.random.players = {};
-  for (const key of Object.keys(leaderboard.random.players)) {
-    const stats = ensurePlayerStats(leaderboard.random.players[key]);
-    if (!stats.displayName) {
-      stats.displayName = isPlayerUid(key) ? "" : String(key);
-    }
-    leaderboard.random.players[key] = stats;
+  if (isLegacyFlatLeaderboard(leaderboard)) {
+    const appBoard = ensurePlatformBoard({
+      random: leaderboard.random,
+      ai: leaderboard.ai,
+    });
+    delete leaderboard.random;
+    delete leaderboard.ai;
+    leaderboard.app = appBoard;
+    leaderboard.web = defaultPlatformBoard();
+    return leaderboard;
   }
-  if (!Array.isArray(leaderboard.random.tanks) || leaderboard.random.tanks.length !== 4) {
-    leaderboard.random.tanks = TANK_DISPLAY_NAMES.map(() => defaultTankStats());
-  } else {
-    leaderboard.random.tanks = leaderboard.random.tanks.map((t) => ensureTankStats(t));
-  }
-  leaderboard.random.matchups = ensureMatchupMatrix(leaderboard.random.matchups);
-  if (!leaderboard.ai) {
-    leaderboard.ai = defaultLeaderboard().ai;
-  }
-  if (!leaderboard.ai.players) leaderboard.ai.players = {};
-  for (const key of Object.keys(leaderboard.ai.players)) {
-    const stats = ensurePlayerStats(leaderboard.ai.players[key]);
-    if (!stats.displayName) {
-      stats.displayName = isPlayerUid(key) ? "" : String(key);
-    }
-    leaderboard.ai.players[key] = stats;
-  }
-  if (!Array.isArray(leaderboard.ai.tanks) || leaderboard.ai.tanks.length !== 4) {
-    leaderboard.ai.tanks = TANK_DISPLAY_NAMES.map(() => defaultTankStats());
-  } else {
-    leaderboard.ai.tanks = leaderboard.ai.tanks.map((t) => ensureTankStats(t));
-  }
-  leaderboard.ai.matchups = ensureMatchupMatrix(leaderboard.ai.matchups);
+  leaderboard.app = ensurePlatformBoard(leaderboard.app || {});
+  leaderboard.web = ensurePlatformBoard(leaderboard.web || {});
   return leaderboard;
 }
 
-function hasLeaderboardStats(leaderboard) {
-  const randomPlayers = Object.keys(leaderboard.random?.players || {}).length;
-  const aiPlayers = Object.keys(leaderboard.ai?.players || {}).length;
-  const randomTanks = (leaderboard.random?.tanks || []).some(
+function getPlatformBoard(root, platform) {
+  const lb = ensureLeaderboardShape(root || {});
+  return lb[normalizeLeaderboardPlatform(platform)];
+}
+
+function hasPlatformStats(board) {
+  const randomPlayers = Object.keys(board?.random?.players || {}).length;
+  const aiPlayers = Object.keys(board?.ai?.players || {}).length;
+  const randomTanks = (board?.random?.tanks || []).some(
     (t) =>
       Number(t.wins || 0) +
         Number(t.losses || 0) +
@@ -201,7 +254,7 @@ function hasLeaderboardStats(leaderboard) {
         Number(t.treasures || 0) >
       0
   );
-  const aiTanks = (leaderboard.ai?.tanks || []).some(
+  const aiTanks = (board?.ai?.tanks || []).some(
     (t) =>
       Number(t.wins || 0) +
         Number(t.losses || 0) +
@@ -211,6 +264,11 @@ function hasLeaderboardStats(leaderboard) {
       0
   );
   return randomPlayers > 0 || aiPlayers > 0 || randomTanks || aiTanks;
+}
+
+function hasLeaderboardStats(leaderboard) {
+  const lb = ensureLeaderboardShape(leaderboard || {});
+  return hasPlatformStats(lb.app) || hasPlatformStats(lb.web);
 }
 
 module.exports = {
@@ -224,14 +282,19 @@ module.exports = {
   HIDDEN_E_MAX,
   HIDDEN_E_DELTA,
   defaultLeaderboard,
+  defaultPlatformBoard,
   defaultPlayerStats,
   defaultTankStats,
   ensureLeaderboardShape,
+  ensurePlatformBoard,
   ensureMatchupMatrix,
   ensurePlayerStats,
   ensureTankStats,
   defaultMatchupMatrix,
   hasLeaderboardStats,
+  hasPlatformStats,
+  getPlatformBoard,
+  normalizeLeaderboardPlatform,
   isPlayerUid,
   normalizePlayerUid,
   extractPublicTag,

@@ -18,6 +18,8 @@ const {
   ensureMatchupMatrix,
   ensurePlayerStats,
   ensureTankStats,
+  getPlatformBoard,
+  normalizeLeaderboardPlatform,
   isPlayerUid,
   normalizePlayerUid,
   extractPublicTag,
@@ -27,7 +29,7 @@ const lbStore = require("./leaderboard_store");
 const { validatePlayerName, extractNamePart } = require("./player_name_rules");
 
 const PORT = process.env.PORT || 8765;
-const SERVER_VERSION = "v57";
+const SERVER_VERSION = "v58";
 const MATCH_BAND_NARROW = 100;
 const MATCH_BAND_WIDE = 250;
 const TANK_ROLE_NAMES = ["重型", "驅逐", "中型", "輕型"];
@@ -97,6 +99,23 @@ function loadLeaderboard() {
 
 function saveLeaderboard(data) {
   lbStore.saveLeaderboard(data);
+}
+
+function normalizePlatform(raw) {
+  return normalizeLeaderboardPlatform(raw);
+}
+
+function applyClientPlatform(client, data) {
+  if (!client || !data || data.platform == null) return normalizePlatform(client && client.platform);
+  client.platform = normalizePlatform(data.platform);
+  return client.platform;
+}
+
+function clientPlatformOf(client, data) {
+  if (data && data.platform != null && client) {
+    return applyClientPlatform(client, data);
+  }
+  return normalizePlatform(client && client.platform);
 }
 
 function pruneAppearanceLog(log, now = Date.now()) {
@@ -280,17 +299,20 @@ function syncLeaderboardDisplayName(uidRaw, displayNameRaw) {
   const uid = normalizePlayerUid(uidRaw);
   const displayName = normalizePlayerName(displayNameRaw);
   if (!uid || !displayName) return;
-  const leaderboard = loadLeaderboard();
+  const root = loadLeaderboard();
   let changed = false;
-  for (const mode of ["random", "ai"]) {
-    const bucket = leaderboard[mode];
-    if (!bucket?.players) continue;
-    const before = JSON.stringify(bucket.players[uid] || null);
-    getOrCreatePlayerStats(bucket, uid, displayName);
-    const after = JSON.stringify(bucket.players[uid] || null);
-    if (before !== after) changed = true;
+  for (const platform of ["app", "web"]) {
+    const board = getPlatformBoard(root, platform);
+    for (const mode of ["random", "ai"]) {
+      const bucket = board[mode];
+      if (!bucket?.players) continue;
+      const before = JSON.stringify(bucket.players[uid] || null);
+      getOrCreatePlayerStats(bucket, uid, displayName);
+      const after = JSON.stringify(bucket.players[uid] || null);
+      if (before !== after) changed = true;
+    }
   }
-  if (changed) saveLeaderboard(leaderboard);
+  if (changed) saveLeaderboard(root);
 }
 
 function pruneDeadClients() {
@@ -376,11 +398,12 @@ function handleReservePlayerName(ws, data) {
 function recordRandomRoomResult(room, winnerIndex, isDraw = false) {
   if (!room || !room.isRandom || room.leaderboardRecorded) return;
   room.leaderboardRecorded = true;
-  const leaderboard = loadLeaderboard();
+  const root = loadLeaderboard();
   for (const player of room.players) {
     const won = !isDraw && player.playerIndex === winnerIndex;
+    const board = getPlatformBoard(root, player.platform);
     recordRandomPlayerResult(
-      leaderboard,
+      board,
       player.uid || "",
       player.displayName,
       player.tankIndex,
@@ -391,9 +414,14 @@ function recordRandomRoomResult(room, winnerIndex, isDraw = false) {
   if (room.players.length === 2) {
     const p0 = room.players.find((p) => p.playerIndex === 0);
     const p1 = room.players.find((p) => p.playerIndex === 1);
-    if (p0 && p1) {
+    if (
+      p0 &&
+      p1 &&
+      normalizePlatform(p0.platform) === normalizePlatform(p1.platform)
+    ) {
+      const board = getPlatformBoard(root, p0.platform);
       recordTankMatchup(
-        leaderboard.random,
+        board.random,
         p0.tankIndex,
         p1.tankIndex,
         !isDraw && winnerIndex === p0.playerIndex,
@@ -401,7 +429,7 @@ function recordRandomRoomResult(room, winnerIndex, isDraw = false) {
       );
     }
   }
-  saveLeaderboard(leaderboard);
+  saveLeaderboard(root);
 }
 
 function playerMatches(stats) {
@@ -599,9 +627,9 @@ function padTopN(entries, count) {
   return result;
 }
 
-function getPlayerStreaks(playerNames, bucketKey) {
-  const leaderboard = loadLeaderboard();
-  const bucket = leaderboard[bucketKey];
+function getPlayerStreaks(playerNames, bucketKey, platform = "app") {
+  const board = getPlatformBoard(loadLeaderboard(), platform);
+  const bucket = board[bucketKey];
   if (!bucket || !bucket.players) {
     return playerNames.map(() => 0);
   }
@@ -615,11 +643,14 @@ function padTop3(entries) {
   return padTopN(entries, 3);
 }
 
-function buildLeaderboardPayload() {
-  const leaderboard = loadLeaderboard();
+function buildLeaderboardPayload(platform = "app") {
+  const boardPlatform = normalizePlatform(platform);
+  const leaderboard = getPlatformBoard(loadLeaderboard(), boardPlatform);
   const now = Date.now();
   return {
     type: "leaderboard",
+    platform: boardPlatform,
+    platform_label: boardPlatform === "web" ? "試玩榜" : "正式榜",
     random_streak_top3: padTop3(getTop3Streak(leaderboard.random.players)),
     random_streak_top10: padTopN(getTop10Streak(leaderboard.random.players), 10),
     random_winrate_top3: padTop3(getTop10PlayerWinrate(leaderboard.random.players)),
@@ -645,8 +676,10 @@ function buildLeaderboardPayload() {
   };
 }
 
-function handleGetLeaderboard(ws) {
-  send(ws, buildLeaderboardPayload());
+function handleGetLeaderboard(ws, data) {
+  const client = clients.get(ws);
+  const platform = clientPlatformOf(client, data);
+  send(ws, buildLeaderboardPayload(platform));
 }
 
 function markRoomCombatRecorded(room, playerName) {
@@ -676,8 +709,11 @@ function handleReportMatchResult(ws, data) {
     normalizePlayerUid(client.ownerToken) ||
     "";
 
+  const platform = clientPlatformOf(client, data);
+
   if (mode === "ai") {
-    const leaderboard = loadLeaderboard();
+    const root = loadLeaderboard();
+    const leaderboard = getPlatformBoard(root, platform);
     recordAiPlayerResult(
       leaderboard,
       playerUid,
@@ -696,7 +732,7 @@ function handleReportMatchResult(ws, data) {
         isDraw
       );
     }
-    saveLeaderboard(leaderboard);
+    saveLeaderboard(root);
     return;
   }
 
@@ -709,14 +745,16 @@ function handleReportMatchResult(ws, data) {
   // 投降／中離等已由房間結算寫入勝敗時，仍可補擊殺／奪寶／出場
   if (room && room.leaderboardRecorded) {
     if (markRoomCombatRecorded(room, playerUid || client.displayName)) {
-      const leaderboard = loadLeaderboard();
+      const root = loadLeaderboard();
+      const leaderboard = getPlatformBoard(root, platform);
       applyCombatStats(leaderboard.random, playerUid, client.displayName, combat);
-      saveLeaderboard(leaderboard);
+      saveLeaderboard(root);
     }
     return;
   }
 
-  const leaderboard = loadLeaderboard();
+  const root = loadLeaderboard();
+  const leaderboard = getPlatformBoard(root, platform);
   recordRandomPlayerResult(
     leaderboard,
     playerUid,
@@ -739,7 +777,7 @@ function handleReportMatchResult(ws, data) {
       isDraw
     );
   }
-  saveLeaderboard(leaderboard);
+  saveLeaderboard(root);
 }
 
 function applyPlayerLoadout(ws, data) {
@@ -1039,7 +1077,11 @@ function tryStartGame(room) {
       rematch: isRematch,
     };
     if (room.isRandom) {
-      payload.player_streaks = getPlayerStreaks(playerNames, "random");
+      payload.player_streaks = getPlayerStreaks(
+        playerNames,
+        "random",
+        player.platform || room.players[0]?.platform || "app"
+      );
     }
     send(player.ws, payload);
   }
@@ -1119,7 +1161,7 @@ function clampHiddenE(value) {
 }
 
 function resolveQueueHiddenE(client, fallback) {
-  const leaderboard = loadLeaderboard();
+  const leaderboard = getPlatformBoard(loadLeaderboard(), client && client.platform);
   const uid = normalizePlayerUid(client.ownerToken);
   const name = normalizePlayerName(client.displayName);
   let stored = null;
@@ -1182,6 +1224,8 @@ function tryMatchRandom() {
         const a = clients.get(wsA);
         const b = clients.get(wsB);
         if (!a || !b) continue;
+        // 網頁試玩與 App 正式版分開配對，避免戰績互相污染
+        if (normalizePlatform(a.platform) !== normalizePlatform(b.platform)) continue;
         const dE = Math.abs(
           clampHiddenE(a.hiddenE) - clampHiddenE(b.hiddenE)
         );
@@ -1213,7 +1257,15 @@ function joinPlayerToRoom(ws, room, playerIndex) {
   const tankIndex = tankRoster[0];
   client.tankRoster = tankRoster;
   client.tankIndex = tankIndex;
-  room.players.push({ ws, playerIndex, displayName, uid, tankIndex, tankRoster });
+  room.players.push({
+    ws,
+    playerIndex,
+    displayName,
+    uid,
+    tankIndex,
+    tankRoster,
+    platform: normalizePlatform(client.platform),
+  });
   client.roomId = room.id;
   client.playerIndex = playerIndex;
 
@@ -1677,7 +1729,9 @@ function buildIdealChainSection(matrix) {
 }
 
 function buildBalanceReportText() {
-  const leaderboard = loadLeaderboard();
+  const root = loadLeaderboard();
+  const leaderboard = getPlatformBoard(root, "app");
+  const webBoard = getPlatformBoard(root, "web");
   const persistence = lbStore.getPersistenceStatus();
   const randomMatrix = ensureMatchupMatrix(leaderboard.random.matchups);
   const aiMatrix = ensureMatchupMatrix(leaderboard.ai.matchups);
@@ -1690,6 +1744,7 @@ function buildBalanceReportText() {
     `雲端持久化: ${persistence.cloudEnabled ? "已啟用" : "未設定"}`,
     `載入來源: ${persistence.source}`,
     "",
+    "※ 以下為 APP 正式榜。網頁試玩榜另計，不計入正式統計。",
     "※ 僅統計「正常戰鬥結束」的對戰；投降、中離不列入。",
     "",
     ...buildMatchupSection("【全部模式合計｜車種對戰勝率】", allMatrix),
@@ -1713,6 +1768,9 @@ function buildBalanceReportText() {
     if (entry.wins + entry.losses <= 0) continue;
     lines.push(`  ${entry.name}：${entry.value}%（${entry.wins}勝/${entry.losses}敗）`);
   }
+
+  const webPlayers = Object.keys(webBoard.random?.players || {}).length;
+  lines.push("", `【網頁試玩榜】隨機玩家數：${webPlayers}（不計入上方正式統計）`);
 
   return lines.join("\n");
 }
@@ -1759,6 +1817,7 @@ wss.on("connection", (ws) => {
     tankIndex: 0,
     tankRoster: [0, 0, 0],
     ownerToken: null,
+    platform: "app",
   });
 
   send(ws, { type: "connected", client_id: clientId, server_version: SERVER_VERSION });
@@ -1771,6 +1830,9 @@ wss.on("connection", (ws) => {
       sendError(ws, "無效的 JSON");
       return;
     }
+
+    const client = clients.get(ws);
+    if (client) applyClientPlatform(client, data);
 
     switch (data.type) {
       case "list_rooms":
@@ -1827,7 +1889,7 @@ wss.on("connection", (ws) => {
         handleReservePlayerName(ws, data);
         break;
       case "get_leaderboard":
-        handleGetLeaderboard(ws);
+        handleGetLeaderboard(ws, data);
         break;
       case "report_match_result":
         handleReportMatchResult(ws, data);
