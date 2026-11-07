@@ -18,11 +18,16 @@ const {
   ensureMatchupMatrix,
   ensurePlayerStats,
   ensureTankStats,
+  isPlayerUid,
+  normalizePlayerUid,
+  extractPublicTag,
+  mergePlayerStatsObjects,
 } = require("./leaderboard_schema");
 const lbStore = require("./leaderboard_store");
+const { validatePlayerName, extractNamePart } = require("./player_name_rules");
 
 const PORT = process.env.PORT || 8765;
-const SERVER_VERSION = "v55";
+const SERVER_VERSION = "v57";
 const MATCH_BAND_NARROW = 100;
 const MATCH_BAND_WIDE = 250;
 const TANK_ROLE_NAMES = ["重型", "驅逐", "中型", "輕型"];
@@ -131,15 +136,63 @@ function normalizeCombatPayload(raw) {
   return { kills, treasures, appeared, tankKills, tankTreasures };
 }
 
-function applyCombatStats(bucket, playerName, combat, now = Date.now()) {
-  if (!combat) return;
-  const name = normalizePlayerName(playerName);
-  if (!bucket.players[name]) {
-    bucket.players[name] = defaultPlayerStats();
-  } else {
-    bucket.players[name] = ensurePlayerStats(bucket.players[name]);
+/** 以 UID 為主鍵取得／建立玩家戰績；舊名稱鍵會遷移過來。 */
+function getOrCreatePlayerStats(bucket, uidRaw, displayNameRaw) {
+  const displayName = normalizePlayerName(displayNameRaw);
+  const uid = normalizePlayerUid(uidRaw);
+  const key = uid || displayName;
+  if (!key) return null;
+
+  if (uid) {
+    // 舊顯示名鍵 → UID
+    if (bucket.players[displayName] && !isPlayerUid(displayName)) {
+      bucket.players[uid] = mergePlayerStatsObjects(
+        bucket.players[uid],
+        bucket.players[displayName]
+      );
+      delete bucket.players[displayName];
+    }
+    const tag = extractPublicTag(displayName);
+    if (tag) {
+      for (const legacyKey of Object.keys(bucket.players)) {
+        if (legacyKey === uid || isPlayerUid(legacyKey)) continue;
+        const legacyStats = ensurePlayerStats(bucket.players[legacyKey]);
+        const legacyName = legacyStats.displayName || legacyKey;
+        if (
+          String(legacyKey).toUpperCase().endsWith("#" + tag) ||
+          String(legacyName).toUpperCase().endsWith("#" + tag)
+        ) {
+          bucket.players[uid] = mergePlayerStatsObjects(bucket.players[uid], legacyStats);
+          delete bucket.players[legacyKey];
+        }
+      }
+    }
   }
-  const player = bucket.players[name];
+
+  if (!bucket.players[key]) {
+    bucket.players[key] = defaultPlayerStats();
+  } else {
+    bucket.players[key] = ensurePlayerStats(bucket.players[key]);
+  }
+  if (displayName) {
+    bucket.players[key].displayName = displayName;
+  } else if (!bucket.players[key].displayName) {
+    bucket.players[key].displayName = isPlayerUid(key) ? "" : String(key);
+  }
+  return bucket.players[key];
+}
+
+function playerEntryDisplayName(key, stats) {
+  const fromStats = String(stats?.displayName || "").trim();
+  if (fromStats) return fromStats;
+  if (isPlayerUid(key)) return "玩家";
+  return String(key || "玩家");
+}
+
+function applyCombatStats(bucket, uid, displayName, combat, now = Date.now()) {
+  if (!combat) return;
+  const player = getOrCreatePlayerStats(bucket, uid, displayName);
+  if (!player) return;
   player.kills += combat.kills;
   player.treasures += combat.treasures;
 
@@ -158,14 +211,9 @@ function applyCombatStats(bucket, playerName, combat, now = Date.now()) {
 }
 
 /** 結算一場（含投降／中離）：更新連勝、勝敗、場次與結算車種勝敗。 */
-function recordModePlayerResult(bucket, playerName, tankIndex, won, isDraw, combat = null) {
-  const name = normalizePlayerName(playerName);
-  if (!bucket.players[name]) {
-    bucket.players[name] = defaultPlayerStats();
-  } else {
-    bucket.players[name] = ensurePlayerStats(bucket.players[name]);
-  }
-  const player = bucket.players[name];
+function recordModePlayerResult(bucket, uid, displayName, tankIndex, won, isDraw, combat = null) {
+  const player = getOrCreatePlayerStats(bucket, uid, displayName);
+  if (!player) return;
   player.matches += 1;
   if (isDraw) {
     player.currentStreak = 0;
@@ -197,7 +245,7 @@ function recordModePlayerResult(bucket, playerName, tankIndex, won, isDraw, comb
   bucket.tanks[normalizeTankIndex(tankIndex)] = tank;
 
   if (combat) {
-    applyCombatStats(bucket, name, combat);
+    applyCombatStats(bucket, uid, displayName, combat);
   }
 }
 
@@ -220,12 +268,29 @@ function recordTankMatchup(bucket, tankA, tankB, aWon, isDraw) {
   }
 }
 
-function recordRandomPlayerResult(leaderboard, playerName, tankIndex, won, isDraw, combat = null) {
-  recordModePlayerResult(leaderboard.random, playerName, tankIndex, won, isDraw, combat);
+function recordRandomPlayerResult(leaderboard, uid, displayName, tankIndex, won, isDraw, combat = null) {
+  recordModePlayerResult(leaderboard.random, uid, displayName, tankIndex, won, isDraw, combat);
 }
 
-function recordAiPlayerResult(leaderboard, playerName, tankIndex, won, isDraw, combat = null) {
-  recordModePlayerResult(leaderboard.ai, playerName, tankIndex, won, isDraw, combat);
+function recordAiPlayerResult(leaderboard, uid, displayName, tankIndex, won, isDraw, combat = null) {
+  recordModePlayerResult(leaderboard.ai, uid, displayName, tankIndex, won, isDraw, combat);
+}
+
+function syncLeaderboardDisplayName(uidRaw, displayNameRaw) {
+  const uid = normalizePlayerUid(uidRaw);
+  const displayName = normalizePlayerName(displayNameRaw);
+  if (!uid || !displayName) return;
+  const leaderboard = loadLeaderboard();
+  let changed = false;
+  for (const mode of ["random", "ai"]) {
+    const bucket = leaderboard[mode];
+    if (!bucket?.players) continue;
+    const before = JSON.stringify(bucket.players[uid] || null);
+    getOrCreatePlayerStats(bucket, uid, displayName);
+    const after = JSON.stringify(bucket.players[uid] || null);
+    if (before !== after) changed = true;
+  }
+  if (changed) saveLeaderboard(leaderboard);
 }
 
 function pruneDeadClients() {
@@ -238,9 +303,24 @@ function pruneDeadClients() {
   }
 }
 
+function buildDisplayName(sanitizedName, rawInput, existingDisplayName) {
+  const clean = String(sanitizedName || "").trim();
+  const rawTag = String(rawInput || "").match(/#([A-Z0-9]{4})\s*$/i);
+  const prevTag = String(existingDisplayName || "").match(/#([A-Z0-9]{4})\s*$/i);
+  const tag = rawTag ? rawTag[1].toUpperCase() : prevTag ? prevTag[1].toUpperCase() : "";
+  if (tag) {
+    return normalizePlayerName(`${clean} #${tag}`);
+  }
+  return normalizePlayerName(clean);
+}
+
 function trySetClientName(client, rawName) {
   pruneDeadClients();
-  const name = normalizePlayerName(rawName);
+  const checked = validatePlayerName(rawName);
+  if (!checked.ok) {
+    return { ok: false, message: checked.message || "名稱不合規" };
+  }
+  const name = buildDisplayName(checked.sanitized, rawName, client.displayName);
 
   if (client.ownerToken) {
     for (const [, other] of clients) {
@@ -255,7 +335,7 @@ function trySetClientName(client, rawName) {
     if (other.id === client.id) continue;
     if (ws.readyState !== ws.OPEN) continue;
     if (normalizePlayerName(other.displayName) !== name) continue;
-    return { ok: false, message: `名稱「${name}」已被其他玩家使用，請換一個` };
+    return { ok: false, message: `名稱「${extractNamePart(name)}」已被其他玩家使用，請換一個` };
   }
 
   client.displayName = name;
@@ -271,10 +351,19 @@ function handleReservePlayerName(ws, data) {
     client.ownerToken = token || null;
   }
 
+  if (data.player_uid != null) {
+    const uid = normalizePlayerUid(data.player_uid);
+    if (uid) client.ownerToken = uid;
+  }
+
   const result = trySetClientName(client, data.player_name);
   if (!result.ok) {
     send(ws, { type: "name_reserved", ok: false, message: result.message });
     return;
+  }
+
+  if (client.ownerToken) {
+    syncLeaderboardDisplayName(client.ownerToken, result.name);
   }
 
   send(ws, {
@@ -292,6 +381,7 @@ function recordRandomRoomResult(room, winnerIndex, isDraw = false) {
     const won = !isDraw && player.playerIndex === winnerIndex;
     recordRandomPlayerResult(
       leaderboard,
+      player.uid || "",
       player.displayName,
       player.tankIndex,
       won,
@@ -322,8 +412,9 @@ function playerMatches(stats) {
 
 function getTop10Streak(players) {
   return Object.entries(players)
-    .map(([name, stats]) => ({
-      name,
+    .map(([key, stats]) => ({
+      uid: isPlayerUid(key) ? key : "",
+      name: playerEntryDisplayName(key, stats),
       value: Number(stats.bestStreak || 0),
       wins: Number(stats.wins || 0),
       losses: Number(stats.losses || 0),
@@ -343,12 +434,13 @@ function getTop3Streak(players) {
 
 function getTop10PlayerWins(players) {
   return Object.entries(players)
-    .map(([name, stats]) => {
+    .map(([key, stats]) => {
       const wins = Number(stats.wins || 0);
       const losses = Number(stats.losses || 0);
       const total = wins + losses;
       return {
-        name,
+        uid: isPlayerUid(key) ? key : "",
+        name: playerEntryDisplayName(key, stats),
         value: wins,
         wins,
         losses,
@@ -368,13 +460,14 @@ function getTop10PlayerWins(players) {
 
 function getTop10PlayerWinrate(players) {
   return Object.entries(players)
-    .map(([name, stats]) => {
+    .map(([key, stats]) => {
       const wins = Number(stats.wins || 0);
       const losses = Number(stats.losses || 0);
       const total = wins + losses;
       const rate = total > 0 ? wins / total : 0;
       return {
-        name,
+        uid: isPlayerUid(key) ? key : "",
+        name: playerEntryDisplayName(key, stats),
         value: total > 0 ? Math.round(rate * 100) : 0,
         wins,
         losses,
@@ -394,12 +487,13 @@ function getTop10PlayerWinrate(players) {
 
 function getTop10PlayerAvg(players, field) {
   return Object.entries(players)
-    .map(([name, stats]) => {
+    .map(([key, stats]) => {
       const matches = playerMatches(stats);
       const total = Number(stats[field] || 0);
       const avg = matches > 0 ? total / matches : 0;
       return {
-        name,
+        uid: isPlayerUid(key) ? key : "",
+        name: playerEntryDisplayName(key, stats),
         value: Math.round(avg * 100) / 100,
         wins: Number(stats.wins || 0),
         losses: Number(stats.losses || 0),
@@ -577,10 +671,16 @@ function handleReportMatchResult(ws, data) {
     data.tank_index != null ? data.tank_index : client.tankIndex
   );
 
+  const playerUid =
+    normalizePlayerUid(data.player_uid) ||
+    normalizePlayerUid(client.ownerToken) ||
+    "";
+
   if (mode === "ai") {
     const leaderboard = loadLeaderboard();
     recordAiPlayerResult(
       leaderboard,
+      playerUid,
       client.displayName,
       playerTank,
       Boolean(data.won),
@@ -608,9 +708,9 @@ function handleReportMatchResult(ws, data) {
 
   // 投降／中離等已由房間結算寫入勝敗時，仍可補擊殺／奪寶／出場
   if (room && room.leaderboardRecorded) {
-    if (markRoomCombatRecorded(room, client.displayName)) {
+    if (markRoomCombatRecorded(room, playerUid || client.displayName)) {
       const leaderboard = loadLeaderboard();
-      applyCombatStats(leaderboard.random, client.displayName, combat);
+      applyCombatStats(leaderboard.random, playerUid, client.displayName, combat);
       saveLeaderboard(leaderboard);
     }
     return;
@@ -619,6 +719,7 @@ function handleReportMatchResult(ws, data) {
   const leaderboard = loadLeaderboard();
   recordRandomPlayerResult(
     leaderboard,
+    playerUid,
     client.displayName,
     playerTank,
     Boolean(data.won),
@@ -627,7 +728,7 @@ function handleReportMatchResult(ws, data) {
   );
   if (room) {
     room.leaderboardRecorded = true;
-    markRoomCombatRecorded(room, client.displayName);
+    markRoomCombatRecorded(room, playerUid || client.displayName);
   }
   if (data.opponent_tank_index != null) {
     recordTankMatchup(
@@ -644,11 +745,22 @@ function handleReportMatchResult(ws, data) {
 function applyPlayerLoadout(ws, data) {
   const client = clients.get(ws);
   if (!client) return false;
+  if (data.client_token != null) {
+    const token = String(data.client_token).trim().slice(0, 64);
+    if (token) client.ownerToken = token;
+  }
+  if (data.player_uid != null) {
+    const uid = normalizePlayerUid(data.player_uid);
+    if (uid) client.ownerToken = uid;
+  }
   if (data.player_name != null) {
     const result = trySetClientName(client, data.player_name);
     if (!result.ok) {
       sendError(ws, result.message);
       return false;
+    }
+    if (client.ownerToken) {
+      syncLeaderboardDisplayName(client.ownerToken, result.name);
     }
   }
   if (data.tank_roster != null || data.tank_index != null) {
@@ -1008,8 +1120,14 @@ function clampHiddenE(value) {
 
 function resolveQueueHiddenE(client, fallback) {
   const leaderboard = loadLeaderboard();
+  const uid = normalizePlayerUid(client.ownerToken);
   const name = normalizePlayerName(client.displayName);
-  const stored = leaderboard.random?.players?.[name];
+  let stored = null;
+  if (uid && leaderboard.random?.players?.[uid]) {
+    stored = leaderboard.random.players[uid];
+  } else if (name && leaderboard.random?.players?.[name]) {
+    stored = leaderboard.random.players[name];
+  }
   if (stored && stored.hiddenE != null) {
     return clampHiddenE(stored.hiddenE);
   }
@@ -1090,11 +1208,12 @@ function joinPlayerToRoom(ws, room, playerIndex) {
   }
 
   const displayName = normalizePlayerName(client.displayName);
+  const uid = normalizePlayerUid(client.ownerToken);
   const tankRoster = normalizeTankRoster(client.tankRoster, client.tankIndex);
   const tankIndex = tankRoster[0];
   client.tankRoster = tankRoster;
   client.tankIndex = tankIndex;
-  room.players.push({ ws, playerIndex, displayName, tankIndex, tankRoster });
+  room.players.push({ ws, playerIndex, displayName, uid, tankIndex, tankRoster });
   client.roomId = room.id;
   client.playerIndex = playerIndex;
 
@@ -1215,6 +1334,7 @@ function handleAnnouncePlayerName(ws, data) {
   const player = room.players.find((entry) => entry.ws === ws);
   if (player) {
     player.displayName = normalizePlayerName(client.displayName);
+    player.uid = normalizePlayerUid(client.ownerToken);
     player.tankRoster = normalizeTankRoster(client.tankRoster, client.tankIndex);
     player.tankIndex = player.tankRoster[0];
   }

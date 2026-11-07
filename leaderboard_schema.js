@@ -18,6 +18,7 @@ const HIDDEN_E_DELTA = 20;
 
 function defaultPlayerStats() {
   return {
+    displayName: "",
     bestStreak: 0,
     currentStreak: 0,
     wins: 0,
@@ -26,6 +27,47 @@ function defaultPlayerStats() {
     kills: 0,
     treasures: 0,
     hiddenE: HIDDEN_E_DEFAULT,
+  };
+}
+
+/** Game UID：TK-XXXX-XXXX-XXXX */
+function isPlayerUid(value) {
+  const uid = String(value || "")
+    .trim()
+    .toUpperCase();
+  return /^TK-[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{4}$/.test(uid);
+}
+
+function normalizePlayerUid(value) {
+  const uid = String(value || "")
+    .trim()
+    .toUpperCase();
+  return isPlayerUid(uid) ? uid : "";
+}
+
+function extractPublicTag(displayName) {
+  const text = String(displayName || "").trim();
+  const m = text.match(/#([A-Z0-9]{4})\s*$/i);
+  return m ? m[1].toUpperCase() : "";
+}
+
+function mergePlayerStatsObjects(a, b) {
+  const left = ensurePlayerStats(a || {});
+  const right = ensurePlayerStats(b || {});
+  const displayName =
+    String(right.displayName || "").trim() ||
+    String(left.displayName || "").trim() ||
+    "";
+  return {
+    displayName,
+    bestStreak: Math.max(left.bestStreak, right.bestStreak),
+    currentStreak: Math.max(left.currentStreak, right.currentStreak),
+    wins: Math.max(left.wins, right.wins),
+    losses: Math.max(left.losses, right.losses),
+    matches: Math.max(left.matches, right.matches),
+    kills: Math.max(left.kills, right.kills),
+    treasures: Math.max(left.treasures, right.treasures),
+    hiddenE: right.hiddenE != null ? right.hiddenE : left.hiddenE,
   };
 }
 
@@ -81,6 +123,7 @@ function ensurePlayerStats(raw) {
   if (!Number.isFinite(hiddenE)) hiddenE = HIDDEN_E_DEFAULT;
   hiddenE = Math.max(HIDDEN_E_MIN, Math.min(HIDDEN_E_MAX, hiddenE));
   return {
+    displayName: String(raw.displayName || "").trim(),
     bestStreak: Number(raw.bestStreak || 0),
     currentStreak: Number(raw.currentStreak || 0),
     wins: Number(raw.wins || 0),
@@ -113,8 +156,12 @@ function ensureLeaderboardShape(leaderboard) {
     leaderboard.random = defaultLeaderboard().random;
   }
   if (!leaderboard.random.players) leaderboard.random.players = {};
-  for (const name of Object.keys(leaderboard.random.players)) {
-    leaderboard.random.players[name] = ensurePlayerStats(leaderboard.random.players[name]);
+  for (const key of Object.keys(leaderboard.random.players)) {
+    const stats = ensurePlayerStats(leaderboard.random.players[key]);
+    if (!stats.displayName) {
+      stats.displayName = isPlayerUid(key) ? "" : String(key);
+    }
+    leaderboard.random.players[key] = stats;
   }
   if (!Array.isArray(leaderboard.random.tanks) || leaderboard.random.tanks.length !== 4) {
     leaderboard.random.tanks = TANK_DISPLAY_NAMES.map(() => defaultTankStats());
@@ -126,8 +173,12 @@ function ensureLeaderboardShape(leaderboard) {
     leaderboard.ai = defaultLeaderboard().ai;
   }
   if (!leaderboard.ai.players) leaderboard.ai.players = {};
-  for (const name of Object.keys(leaderboard.ai.players)) {
-    leaderboard.ai.players[name] = ensurePlayerStats(leaderboard.ai.players[name]);
+  for (const key of Object.keys(leaderboard.ai.players)) {
+    const stats = ensurePlayerStats(leaderboard.ai.players[key]);
+    if (!stats.displayName) {
+      stats.displayName = isPlayerUid(key) ? "" : String(key);
+    }
+    leaderboard.ai.players[key] = stats;
   }
   if (!Array.isArray(leaderboard.ai.tanks) || leaderboard.ai.tanks.length !== 4) {
     leaderboard.ai.tanks = TANK_DISPLAY_NAMES.map(() => defaultTankStats());
@@ -181,4 +232,8 @@ module.exports = {
   ensureTankStats,
   defaultMatchupMatrix,
   hasLeaderboardStats,
+  isPlayerUid,
+  normalizePlayerUid,
+  extractPublicTag,
+  mergePlayerStatsObjects,
 };
