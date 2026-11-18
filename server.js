@@ -29,7 +29,7 @@ const lbStore = require("./leaderboard_store");
 const { validatePlayerName, extractNamePart } = require("./player_name_rules");
 
 const PORT = process.env.PORT || 8765;
-const SERVER_VERSION = "v58";
+const SERVER_VERSION = "v59";
 const MATCH_BAND_NARROW = 100;
 const MATCH_BAND_WIDE = 250;
 const TANK_ROLE_NAMES = ["重型", "驅逐", "中型", "輕型"];
@@ -42,6 +42,10 @@ const IDEAL_ADVANTAGE_PAIRS = [
 ];
 
 const DEFAULT_TANK_POSITIONS = [[6, 9], [3, 0]];
+/** 2v2／7×7 出生點（與客戶端 player_spawn／opponent_spawn 對齊） */
+const DEFAULT_TANK_POSITIONS_2V2 = [[5, 6], [1, 0]];
+const MATCH_MODE_3V3 = "3v3";
+const MATCH_MODE_2V2 = "2v2";
 // 僅作卡死保險：須覆蓋開場拋硬幣／攻守交換動畫 + 客戶端 20s，不可比客戶端倒數更早觸發
 const TURN_BACKUP_FIRST_ROUND_MS = 70000;
 const TURN_BACKUP_ROUND_MS = 55000;
@@ -78,19 +82,32 @@ function normalizeTankIndex(raw) {
   return index;
 }
 
-/** 正規化 3 車編隊；缺漏以先頭車補齊 */
-function normalizeTankRoster(raw, fallbackIndex = 0) {
+function normalizeMatchMode(raw) {
+  const mode = String(raw || "")
+    .trim()
+    .toLowerCase();
+  if (mode === MATCH_MODE_2V2 || mode === "2vs2") return MATCH_MODE_2V2;
+  return MATCH_MODE_3V3;
+}
+
+function teamSizeForMode(mode) {
+  return normalizeMatchMode(mode) === MATCH_MODE_2V2 ? 2 : 3;
+}
+
+/** 正規化出戰編隊；缺漏以先頭車補齊（長度依 match_mode：3v3=3／2v2=2） */
+function normalizeTankRoster(raw, fallbackIndex = 0, teamSize = 3) {
+  const size = Math.max(1, Math.min(3, Number(teamSize) || 3));
   const fallback = normalizeTankIndex(fallbackIndex);
   const out = [];
   if (Array.isArray(raw)) {
     for (const entry of raw) {
       out.push(normalizeTankIndex(entry));
-      if (out.length >= 3) break;
+      if (out.length >= size) break;
     }
   }
   if (out.length === 0) out.push(fallback);
-  while (out.length < 3) out.push(out[0]);
-  return out.slice(0, 3);
+  while (out.length < size) out.push(out[0]);
+  return out.slice(0, size);
 }
 
 function loadLeaderboard() {
@@ -801,10 +818,14 @@ function applyPlayerLoadout(ws, data) {
       syncLeaderboardDisplayName(client.ownerToken, result.name);
     }
   }
+  if (data.match_mode != null) {
+    client.matchMode = normalizeMatchMode(data.match_mode);
+  }
   if (data.tank_roster != null || data.tank_index != null) {
     const leadFallback =
       data.tank_index != null ? normalizeTankIndex(data.tank_index) : client.tankIndex;
-    client.tankRoster = normalizeTankRoster(data.tank_roster, leadFallback);
+    const teamSize = teamSizeForMode(client.matchMode || MATCH_MODE_3V3);
+    client.tankRoster = normalizeTankRoster(data.tank_roster, leadFallback, teamSize);
     client.tankIndex = client.tankRoster[0];
   }
   return true;
@@ -910,10 +931,11 @@ function getSortedTankIndices(room) {
 }
 
 function getSortedTankRosters(room) {
+  const teamSize = teamSizeForMode(room && room.matchMode);
   return room.players
     .slice()
     .sort((a, b) => a.playerIndex - b.playerIndex)
-    .map((player) => normalizeTankRoster(player.tankRoster, player.tankIndex));
+    .map((player) => normalizeTankRoster(player.tankRoster, player.tankIndex, teamSize));
 }
 
 function normalizeTurnCells(raw, allowEmpty = false) {
@@ -1046,15 +1068,21 @@ function tryStartGame(room) {
   clearTurnTimer(room);
   room.state = "playing";
   room.turns = [{}, {}];
-  room.tankPositions = DEFAULT_TANK_POSITIONS.map((pos) => [...pos]);
+  room.matchMode = normalizeMatchMode(room.matchMode || MATCH_MODE_3V3);
+  const spawnTable =
+    room.matchMode === MATCH_MODE_2V2
+      ? DEFAULT_TANK_POSITIONS_2V2
+      : DEFAULT_TANK_POSITIONS;
+  room.tankPositions = spawnTable.map((pos) => [...pos]);
   room.leaderboardRecorded = false;
   room._rematchRestart = false;
   resetRematchVotes(room);
+  const teamSize = teamSizeForMode(room.matchMode);
   // 同步房間內最新車種／編隊
   for (const player of room.players) {
     const client = clients.get(player.ws);
     if (client) {
-      player.tankRoster = normalizeTankRoster(client.tankRoster, client.tankIndex);
+      player.tankRoster = normalizeTankRoster(client.tankRoster, client.tankIndex, teamSize);
       player.tankIndex = player.tankRoster[0];
       player.displayName = normalizePlayerName(client.displayName);
     }
@@ -1074,6 +1102,7 @@ function tryStartGame(room) {
       tank_indices: tankIndices,
       tank_rosters: tankRosters,
       is_random: Boolean(room.isRandom),
+      match_mode: room.matchMode,
       rematch: isRematch,
     };
     if (room.isRandom) {
@@ -1187,6 +1216,8 @@ function currentMatchBand(client, now = Date.now()) {
 
 function startRandomRoom(wsA, wsB) {
   const roomId = makeRoomId();
+  const clientA = clients.get(wsA);
+  const matchMode = normalizeMatchMode(clientA && clientA.matchMode);
   const room = {
     id: roomId,
     name: `隨機對戰 ${roomId}`,
@@ -1195,6 +1226,7 @@ function startRandomRoom(wsA, wsB) {
     turns: [{}, {}],
     players: [],
     isRandom: true,
+    matchMode,
     rematchReady: [false, false],
   };
   rooms.set(roomId, room);
@@ -1226,6 +1258,8 @@ function tryMatchRandom() {
         if (!a || !b) continue;
         // 網頁試玩與 App 正式版分開配對，避免戰績互相污染
         if (normalizePlatform(a.platform) !== normalizePlatform(b.platform)) continue;
+        // 2v2／3v3 佇列隔離（含偽 AI 前的真人撮合）
+        if (normalizeMatchMode(a.matchMode) !== normalizeMatchMode(b.matchMode)) continue;
         const dE = Math.abs(
           clampHiddenE(a.hiddenE) - clampHiddenE(b.hiddenE)
         );
@@ -1315,6 +1349,7 @@ function handleCreateRoom(ws, data) {
     turns: [{}, {}],
     players: [],
     isRandom: false,
+    matchMode: MATCH_MODE_3V3,
     rematchReady: [false, false],
   };
   rooms.set(roomId, room);
@@ -1358,6 +1393,10 @@ function handleJoinRandom(ws, data) {
   leaveRoom(ws);
   const client = clients.get(ws);
   if (!client) return;
+  client.matchMode = normalizeMatchMode(data && data.match_mode);
+  const teamSize = teamSizeForMode(client.matchMode);
+  client.tankRoster = normalizeTankRoster(client.tankRoster, client.tankIndex, teamSize);
+  client.tankIndex = client.tankRoster[0];
   client.hiddenE = resolveQueueHiddenE(client, data.hidden_e);
   client.queueT1Ms = Math.max(1000, Math.round(Number(data.t1_sec || 5) * 1000));
   client.queueT2Ms = Math.max(client.queueT1Ms + 1000, Math.round(Number(data.t2_sec || 10) * 1000));
@@ -1370,6 +1409,7 @@ function handleJoinRandom(ws, data) {
     hidden_e: client.hiddenE,
     t1_sec: client.queueT1Ms / 1000,
     t2_sec: client.queueT2Ms / 1000,
+    match_mode: client.matchMode,
   });
   tryMatchRandom();
 }
@@ -1541,6 +1581,9 @@ function handleSupplyArm(ws, data) {
     "double_damage",
     "reactive_armor",
     "super_boost",
+    "extra_shot",
+    "reflect_armor",
+    "airstrike_support",
     "medkit",
     "stop_mine",
     "blast_mine",
@@ -1569,13 +1612,18 @@ function handleSupplyArm(ws, data) {
     ? room.turns.filter((turn) => turnHasPayload(turn)).length
     : 0;
 
-  broadcastAll(room, {
+  const armedPayload = {
     type: "supply_armed",
     player_index: client.playerIndex,
     type_id: typeId,
     ready,
     revise_attacker: reviseAttacker,
-  });
+  };
+  if (Number.isInteger(Number(data.x)) && Number.isInteger(Number(data.y))) {
+    armedPayload.x = Number(data.x);
+    armedPayload.y = Number(data.y);
+  }
+  broadcastAll(room, armedPayload);
 
   if (reviseAttacker) {
     broadcastAll(room, {
